@@ -1,4 +1,6 @@
-﻿import json
+import json, os
+creds = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+
 import logging
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -30,3 +32,4 @@ app.add_handler(CommandHandler("start", start))
 if __name__ == "__main__":
     print("Bot is running...")
     app.run_polling()
+
