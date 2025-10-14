@@ -207,7 +207,8 @@ async def sheets_update_range(ws_name: str, start_row: int, start_col: int, valu
     try:
         w = open_sheet(ws_name)
         cell_range = gspread.utils.rowcol_to_a1(start_row, start_col) + ":" + gspread.utils.rowcol_to_a1(start_row + len(values) - 1, start_col + (len(values[0]) - 1))
-        w.update(cell_range, values)
+        # new API prefers named args; pass values and range_name explicitly
+        w.update(range_name=cell_range, values=values)
         return True
     except Exception:
         logger.exception("sheets_update_range failed for %s", ws_name)
@@ -217,7 +218,8 @@ async def sheets_update_row(ws_name: str, row_idx: int, values: List[Any]) -> bo
     try:
         w = open_sheet(ws_name)
         cell_range = f"A{row_idx}:{gspread.utils.rowcol_to_a1(row_idx, len(values))}"
-        w.update(cell_range, [values])
+        # use named args to avoid deprecation
+        w.update(range_name=cell_range, values=[values])
         return True
     except Exception:
         logger.exception("sheets_update_row failed for %s row %s", ws_name, row_idx)
@@ -783,7 +785,7 @@ async def on_startup(dp_obj):
         logger.exception("Failed to create background tasks.")
 
 # Robust polling wrapper
-def run_polling_with_retries(skip_updates: bool = True, max_retries: int = 10):
+def run_polling_with_retries(skip_updates: bool = True, max_retries: int = 20):
     attempt = 0
     while True:
         attempt += 1
@@ -793,9 +795,22 @@ def run_polling_with_retries(skip_updates: bool = True, max_retries: int = 10):
             logger.info("executor.start_polling returned normally.")
             break
         except TerminatedByOtherGetUpdates as e:
-            logger.warning("TerminatedByOtherGetUpdates: %s", e)
-            logger.error("Detected another running instance (same token). Exiting. Ensure only one bot instance is running.")
-            break
+            # مهم: وقتی این خطا می‌آید به این معنی است که جای دیگری polling شده است.
+            logger.error("TerminatedByOtherGetUpdates: %s", e)
+            # اخطار روشن برای کاربر/ادمین بفرست اگر قابل دسترسی است
+            if ADMIN_TELEGRAM_ID:
+                try:
+                    loop = asyncio.get_event_loop()
+                    # ارسال پیام ادمین به صورت هم‌زمان (بدون بلاک کردن)
+                    loop.create_task(bot.send_message(int(ADMIN_TELEGRAM_ID),
+                        "⚠️ خطای اجرا: یک instance دیگر این بات با همان توکن در حال اجرا است. لطفاً تنها یک instance فعال داشته باشید یا توکن را تغییر دهید."))
+                except Exception:
+                    logger.exception("Could not notify admin about TerminatedByOtherGetUpdates.")
+            # در این حالت بهتر است برنامه خاتمه دهد تا Render یا سرویس دیگر اجازهٔ restart ندهد
+            logger.error("Exiting due to TerminatedByOtherGetUpdates. Ensure no other instances are running with same token.")
+            # خروج امن
+            import sys
+            sys.exit(0)
         except Exception as e:
             logger.exception("Unhandled exception in polling: %s", e)
             wait = min(60, 5 * attempt)
@@ -811,4 +826,5 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
