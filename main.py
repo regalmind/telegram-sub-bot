@@ -1,5 +1,6 @@
 # main.py
 # نسخهٔ کامل و مقاوم‌شده برای اجرا روی Render (و محلی)
+# - حذف وبهوک قبل از شروع polling تا از conflict جلوگیری شود
 # - خواندن GOOGLE_CREDENTIALS به صورت raw JSON یا base64 یا از فایل GOOGLE_SERVICE_ACCOUNT
 # - استفاده از run_in_executor برای تماس blocking به Google Sheets
 # - اضافه کردن یک health HTTP endpoint با aiohttp تا Render پورت را ببیند (در صورت وب سرویس)
@@ -38,16 +39,8 @@ if not SPREADSHEET_ID:
 
 # ---------- Google credentials loader ----------
 def load_google_creds():
-    """
-    Try to load Google service account credentials from:
-    1) env GOOGLE_CREDENTIALS (raw JSON)
-    2) env GOOGLE_CREDENTIALS (base64 encoded JSON)
-    3) fallback: file path from GOOGLE_SERVICE_ACCOUNT (default: service-account.json)
-    The function attempts safe parses and logs helpful messages.
-    """
     creds_env = os.environ.get("GOOGLE_CREDENTIALS")
     if creds_env:
-        # 1) try raw JSON
         try:
             creds = json.loads(creds_env)
             logger.info("Loaded Google credentials from GOOGLE_CREDENTIALS (raw JSON).")
@@ -55,7 +48,6 @@ def load_google_creds():
         except json.JSONDecodeError as e_raw:
             logger.warning("GOOGLE_CREDENTIALS raw JSON parse failed: %s", e_raw)
 
-        # 2) try to recover JSON substring if someone pasted extra text
         try:
             start = creds_env.find('{')
             end = creds_env.rfind('}')
@@ -67,7 +59,6 @@ def load_google_creds():
         except Exception as e_sub:
             logger.warning("Failed to recover JSON substring from GOOGLE_CREDENTIALS: %s", e_sub)
 
-        # 3) try base64 decode (validate=True to ensure valid base64)
         try:
             decoded = base64.b64decode(creds_env, validate=True)
             try:
@@ -81,7 +72,6 @@ def load_google_creds():
         except (binascii.Error, ValueError) as e_b64:
             logger.warning("GOOGLE_CREDENTIALS is not valid base64: %s", e_b64)
 
-    # 4) fallback: try to read a file whose path/name is in GOOGLE_SERVICE_ACCOUNT
     sa_path = os.environ.get("GOOGLE_SERVICE_ACCOUNT", "service-account.json")
     if os.path.exists(sa_path):
         try:
@@ -115,9 +105,6 @@ dp = Dispatcher(bot)
 
 # ---------- Synchronous append wrapped for executor ----------
 def _sync_append(values):
-    """
-    Blocking call to Google Sheets API.
-    """
     try:
         sheet.values().append(
             spreadsheetId=SPREADSHEET_ID,
@@ -130,9 +117,6 @@ def _sync_append(values):
         raise
 
 async def add_to_sheet(values):
-    """
-    Run blocking Google Sheets append in threadpool to avoid blocking the event loop.
-    """
     loop = asyncio.get_running_loop()
     try:
         await loop.run_in_executor(None, _sync_append, values)
@@ -143,7 +127,6 @@ async def add_to_sheet(values):
 # ---------- Bot handlers ----------
 @dp.message_handler(commands=["start"])
 async def start(message: types.Message):
-    # remove keyboard and ask for email
     await message.answer(
         "👋 خوش آمدید!\nبرای ادامه لطفاً ایمیل خود را وارد کنید:",
         reply_markup=types.ReplyKeyboardRemove()
@@ -161,7 +144,6 @@ async def get_email(message: types.Message):
             datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "شروع ثبت"
         ])
-        # reply with menu keyboard
         keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
         buttons = [
             ["تست کانال معمولی", "خرید کانال معمولی"],
@@ -195,36 +177,38 @@ async def support(message: types.Message):
 async def platform_info(message: types.Message):
     await message.answer("📘 توضیحات پلتفرم به‌زودی در این بخش قرار خواهد گرفت.")
 
-# ---------- Simple health webserver for Render (so Render sees an open port) ----------
+# ---------- Simple health webserver for Render ----------
 async def start_webserver():
     async def handle(request):
         return web.Response(text="OK")
 
     app = web.Application()
     app.router.add_get("/", handle)
-
-    # Render sets PORT env var for web services; fallback to 8000
     port = int(os.environ.get("PORT", "8000"))
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logger.info("Health webserver started on port %s", port)
-    # not blocking; just leaves the site running
 
 # ---------- Entry point ----------
 if __name__ == "__main__":
-    # print small marker so logs are easy to find in Render
     print("=== BOT STARTING ===")
-
     loop = asyncio.get_event_loop()
 
     # Start webserver (so Render's port scan finds a listening port).
-    # If you intentionally use Background Worker and don't want a webserver remove this call.
     try:
         loop.run_until_complete(start_webserver())
     except Exception:
         logger.exception("Failed to start health webserver; continuing without it.")
+
+    # IMPORTANT: delete webhook (if any) BEFORE polling to avoid TerminatedByOtherGetUpdates
+    try:
+        logger.info("Deleting webhook (if set) to avoid conflicts with polling...")
+        loop.run_until_complete(bot.delete_webhook(drop_pending_updates=True))
+        logger.info("delete_webhook() completed.")
+    except Exception:
+        logger.exception("Failed to delete webhook (continuing to start polling)")
 
     # Start polling (this will block current thread and keep running)
     try:
