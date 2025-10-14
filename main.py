@@ -1,13 +1,5 @@
-# main.py
-# نسخهٔ به‌روزشده با اصلاحات:
-# - تولید کد رفرال فقط بعد از اولین خرید تاییدشده
-# - شناسایی کاربر موجود (اگر ربات پاک شده دوباره) و نمایش منو بدون درخواست ایمیل
-# - حذف (بَن) کاربر پس از پایان تست و جلوگیری از ورود مجدد از طریق آی‌دی/یوزرنیم
-# - پیام‌رسانی بعد از حذف و هدایت به خرید
-# - اصلاح ستون‌بندی Users و به‌روزرسانی ردیف به جای append تکراری
-# - امکان تأیید خرید از طریق شیت یا دستور ادمین /confirm <row_num>
-# - همهٔ اصلاحات قبلی حفظ شده‌اند
-
+# main.py (UPDATED)
+# شامل اصلاح برای خطاهای rebuild_schedules_from_subscriptions و ارسال لیست pending به ادمین
 import os
 import json
 import base64
@@ -32,7 +24,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name
 logger = logging.getLogger("telegram-sub-bot")
 
 # -------------------------
-# Env vars (set these in Render or your environment)
+# Env vars
 # -------------------------
 TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID") or os.getenv("SPREADSHEET")
@@ -40,13 +32,12 @@ GOOGLE_CREDENTIALS_ENV = os.getenv("GOOGLE_CREDENTIALS")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT", "service-account.json")
 PORT = int(os.getenv("PORT", "8000"))
 
-REQUIRED_CHANNELS = os.getenv("REQUIRED_CHANNELS", "")  # comma-separated
+REQUIRED_CHANNELS = os.getenv("REQUIRED_CHANNELS", "")
 CHANNEL_TEST = os.getenv("CHANNEL_TEST", "")
 CHANNEL_NORMAL = os.getenv("CHANNEL_NORMAL", "")
 CHANNEL_PREMIUM = os.getenv("CHANNEL_PREMIUM", "")
 ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID")) if os.getenv("ADMIN_TELEGRAM_ID") else None
 
-# Basic validation
 if not TOKEN:
     logger.error("Missing BOT_TOKEN / TELEGRAM_TOKEN")
     raise SystemExit("Missing BOT_TOKEN / TELEGRAM_TOKEN")
@@ -55,7 +46,7 @@ if not SPREADSHEET_ID:
     raise SystemExit("Missing SPREADSHEET_ID")
 
 # -------------------------
-# Google creds loader (robust)
+# Google creds loader
 # -------------------------
 def load_google_creds() -> Dict[str, Any]:
     if GOOGLE_CREDENTIALS_ENV:
@@ -65,7 +56,7 @@ def load_google_creds() -> Dict[str, Any]:
             logger.info("Loaded Google credentials from GOOGLE_CREDENTIALS (raw JSON).")
             return data
         except json.JSONDecodeError:
-            logger.debug("GOOGLE_CREDENTIALS not raw JSON; attempt substring/base64.")
+            logger.debug("GOOGLE_CREDENTIALS not raw JSON; try substring/base64.")
         try:
             start = s.find("{"); end = s.rfind("}")
             if start != -1 and end != -1 and end > start:
@@ -90,11 +81,11 @@ def load_google_creds() -> Dict[str, Any]:
                 return data
         except Exception as e:
             logger.exception("Failed to load/parse GOOGLE_SERVICE_ACCOUNT file '%s': %s", GOOGLE_SERVICE_ACCOUNT_FILE, e)
-    logger.error("No valid Google credentials found. Provide GOOGLE_CREDENTIALS or upload service-account.json.")
+    logger.error("No valid Google credentials found.")
     raise SystemExit("Missing Google credentials")
 
 # -------------------------
-# Initialize Google Sheets client
+# Initialize Sheets
 # -------------------------
 try:
     creds_info = load_google_creds()
@@ -103,19 +94,19 @@ try:
     sheets = sheets_service.spreadsheets()
     logger.info("Google Sheets client initialized.")
 except Exception as e:
-    logger.exception("Failed to initialize Google Sheets client: %s", e)
+    logger.exception("Failed to init Google Sheets client: %s", e)
     sheets = None
 
 # -------------------------
-# Bot & dispatcher
+# Bot & Dispatcher
 # -------------------------
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
 
 # -------------------------
-# Sheets blocking wrappers (executor)
+# Sheets wrappers
 # -------------------------
-def _sheets_get_meta(spreadsheet_id: str):
+def _sheets_get(spreadsheet_id: str):
     return sheets.get(spreadsheetId=spreadsheet_id).execute()
 
 def _sheets_values_get(spreadsheet_id: str, range_name: str):
@@ -143,7 +134,7 @@ async def run_in_executor(func, *args, retries: int = 2, delay: float = 1.0):
                 raise
 
 async def sheets_meta(spreadsheet_id: str):
-    return await run_in_executor(_sheets_get_meta, spreadsheet_id)
+    return await run_in_executor(_sheets_get, spreadsheet_id)
 async def sheets_values_get(spreadsheet_id: str, range_name: str):
     return await run_in_executor(_sheets_values_get, spreadsheet_id, range_name)
 async def sheets_values_append(spreadsheet_id: str, range_name: str, row: List[Any]):
@@ -154,7 +145,7 @@ async def sheets_batch_update(spreadsheet_id: str, body: Dict[str, Any]):
     return await run_in_executor(_sheets_batch_update, spreadsheet_id, body)
 
 # -------------------------
-# Default sheet names & headers
+# Defaults
 # -------------------------
 DEFAULT_SHEET_TITLES = ["Users", "Purchases", "Referrals", "Support", "Subscriptions"]
 DEFAULT_HEADERS = {
@@ -179,7 +170,6 @@ async def ensure_sheets_and_headers() -> bool:
         if requests:
             await sheets_batch_update(SPREADSHEET_ID, {"requests": requests})
             await asyncio.sleep(0.5)
-        # ensure headers
         for title in DEFAULT_SHEET_TITLES:
             header_range = f"{title}!A1:{chr(65 + len(DEFAULT_HEADERS[title]) - 1)}1"
             existing = await sheets_values_get(SPREADSHEET_ID, f"{title}!A1:Z1")
@@ -192,7 +182,7 @@ async def ensure_sheets_and_headers() -> bool:
         return False
 
 # -------------------------
-# Helpers: parse required channels
+# util helpers
 # -------------------------
 def parse_channel_list(s: str) -> List[str]:
     if not s:
@@ -200,13 +190,7 @@ def parse_channel_list(s: str) -> List[str]:
     return [it.strip() for it in s.split(",") if it.strip()]
 REQUIRED_CHANNELS_LIST = parse_channel_list(REQUIRED_CHANNELS)
 
-# -------------------------
-# Find user in Users sheet (returns row index - absolute)
-# -------------------------
 async def find_user_row(telegram_id: int) -> Optional[Dict[str, Any]]:
-    """
-    Returns dict {row_index:int, row:List[str]} or None
-    """
     try:
         data = await sheets_values_get(SPREADSHEET_ID, "Users!A2:G")
         rows = data.get("values", []) if data else []
@@ -219,36 +203,26 @@ async def find_user_row(telegram_id: int) -> Optional[Dict[str, Any]]:
         return None
 
 async def update_user_row(row_index: int, row_values: List[Any]):
-    # ensure length matches headers
     maxlen = len(DEFAULT_HEADERS["Users"])
     row_values = (row_values + [""] * maxlen)[:maxlen]
     range_name = f"Users!A{row_index}:{chr(65+maxlen-1)}{row_index}"
     return await sheets_values_update(SPREADSHEET_ID, range_name, [row_values])
 
-# -------------------------
-# Referral generator (only after first confirmed purchase)
-# -------------------------
 def make_referral_code() -> str:
     return "R" + secrets.token_hex(4).upper()
 
 async def ensure_referral_for_user(telegram_id: int, user_full_name: str):
-    # check Referrals sheet for existing
     try:
         data = await sheets_values_get(SPREADSHEET_ID, "Referrals!A2:D")
         rows = data.get("values", []) if data else []
         for r in rows:
             if len(r) > 0 and str(r[0]) == str(telegram_id):
-                # return existing code
                 return r[1] if len(r) > 1 else None
-        # not found -> create
         code = make_referral_code()
         await sheets_values_append(SPREADSHEET_ID, "Referrals!A:D", [telegram_id, code, 0, datetime.utcnow().isoformat()])
-        # also update Users sheet referral_code column if exists
         u = await find_user_row(telegram_id)
         if u:
             row = u["row"]
-            # build row to update: keep existing fields but set referral_code
-            # columns: telegram_id, full_name, email, registered_at, referrer, referral_code, notes
             full_name = row[1] if len(row) > 1 else user_full_name
             email = row[2] if len(row) > 2 else ""
             registered_at = row[3] if len(row) > 3 else datetime.utcnow().isoformat()
@@ -262,7 +236,7 @@ async def ensure_referral_for_user(telegram_id: int, user_full_name: str):
         return None
 
 # -------------------------
-# Chat membership helpers
+# Chat helpers
 # -------------------------
 async def is_member_of(chat_id_or_username: str, user_id: int) -> bool:
     try:
@@ -305,9 +279,8 @@ async def create_invite_link(chat_id_or_username: str, expire_seconds: Optional[
         return None
 
 # -------------------------
-# Removal scheduling & banning strategy
+# Removal scheduling & banning
 # -------------------------
-# We'll BAN user on removal (prevent rejoin by username/ID). When activating subscription, we'll UNBAN before invite.
 scheduled_tasks: Dict[str, asyncio.Task] = {}
 
 async def schedule_removal(telegram_id: int, chat_id_or_username: str, when: datetime):
@@ -323,17 +296,14 @@ async def schedule_removal(telegram_id: int, chat_id_or_username: str, when: dat
             await asyncio.sleep(delay)
             chat = int(chat_id_or_username) if str(chat_id_or_username).lstrip("-").isdigit() else chat_id_or_username
             try:
-                # Ban permanently (effectively). Admin can unban when activating subscription.
                 await bot.ban_chat_member(chat, telegram_id)
-                logger.info("Banned (removed) user %d from %s", telegram_id, chat_id_or_username)
-                # mark in Subscriptions or Purchases sheet (optional)
+                logger.info("Banned user %d from %s", telegram_id, chat_id_or_username)
                 try:
                     await sheets_values_append(SPREADSHEET_ID, "Subscriptions!A:E", [telegram_id, chat_id_or_username, "", datetime.utcnow().isoformat(), "FALSE"])
                 except Exception:
                     pass
-                # notify user and guide to purchase
                 try:
-                    await bot.send_message(telegram_id, "⏳ مدت تست شما به پایان رسید و از کانال حذف شدید. برای دسترسی کامل و اشتراک، از منوی ربات گزینهٔ خرید را انتخاب کنید.")
+                    await bot.send_message(telegram_id, "⏳ مدت شما به پایان رسید و از کانال حذف شدید. برای دسترسی کامل، از منوی ربات گزینهٔ خرید را انتخاب کنید.")
                     await bot.send_message(telegram_id, "📌 برای خرید سریع: از منوی اصلی گزینهٔ 'خرید کانال معمولی' یا 'خرید کانال ویژه' را انتخاب کنید.")
                 except Exception:
                     logger.exception("Failed to send removal notice to user %d", telegram_id)
@@ -347,9 +317,6 @@ async def schedule_removal(telegram_id: int, chat_id_or_username: str, when: dat
     scheduled_tasks[key] = task
     return task
 
-# -------------------------
-# Activate subscription (unban before invite)
-# -------------------------
 async def activate_subscription_for_user(telegram_id: int, product: str, months: int = 6):
     channels_to_invite = []
     if product == "normal":
@@ -362,43 +329,36 @@ async def activate_subscription_for_user(telegram_id: int, product: str, months:
             channels_to_invite.append(CHANNEL_PREMIUM)
     activated_at = datetime.utcnow()
     expires_at = activated_at + timedelta(days=30 * months)
-    # unban before inviting (in case previously banned)
     for ch in channels_to_invite:
         try:
             chat = int(ch) if str(ch).lstrip("-").isdigit() else ch
             try:
-                # unban to allow invite
                 await bot.unban_chat_member(chat, telegram_id)
             except Exception:
-                # ignore if cannot unban or not banned
                 pass
             link = await create_invite_link(ch, expire_seconds=60 * 60 * 24)
             if link:
                 await bot.send_message(telegram_id, f"✅ اشتراک شما برای کانال {ch} فعال شد. از لینک زیر برای پیوستن استفاده کنید:\n{link}")
             else:
-                await bot.send_message(telegram_id, f"✅ اشتراک شما برای کانال {ch} فعال شد. اما لینک اتوماتیک ساخته نشد — لطفاً دستی عضو شوید: {ch}")
+                await bot.send_message(telegram_id, f"✅ اشتراک شما برای کانال {ch} فعال شد. لطفاً دستی عضو شوید: {ch}")
         except Exception as e:
             logger.exception("Error inviting user %d to %s: %s", telegram_id, ch, e)
-    # record subscription
     try:
         await sheets_values_append(SPREADSHEET_ID, "Subscriptions!A:E", [telegram_id, product, activated_at.isoformat(), expires_at.isoformat(), "TRUE"])
     except Exception as e:
         logger.exception("Failed to write Subscriptions row: %s", e)
-    # schedule removal (ban) at expires
     for ch in channels_to_invite:
         try:
             await schedule_removal(telegram_id, ch, expires_at)
         except Exception as e:
             logger.exception("Failed to schedule removal for %d from %s: %s", telegram_id, ch, e)
-    # ensure referral code generation (only now, since first confirmed purchase)
     try:
-        # Get full name from Users sheet or fallback
         u = await find_user_row(telegram_id)
         full_name = u["row"][1] if u and len(u["row"]) > 1 else ""
         code = await ensure_referral_for_user(telegram_id, full_name)
         if code:
             try:
-                await bot.send_message(telegram_id, f"🎉 خرید شما تایید شد! کد معرفی شما: `{code}`\nاین کد را به دوستانتان بدهید تا از پورسانت بهره‌مند شوید.", parse_mode="Markdown")
+                await bot.send_message(telegram_id, f"🎉 خرید شما تایید شد! کد معرفی شما: `{code}`", parse_mode="Markdown")
             except Exception:
                 pass
     except Exception as e:
@@ -408,6 +368,7 @@ async def activate_subscription_for_user(telegram_id: int, product: str, months:
 # Background pollers
 # -------------------------
 POLL_INTERVAL = 20
+pending_notified_rows = set()
 
 async def poll_purchases_and_activate():
     while True:
@@ -426,8 +387,7 @@ async def poll_purchases_and_activate():
                             await activate_subscription_for_user(telegram_id, product, months=months)
                             activated_iso = datetime.utcnow().isoformat()
                             expires_iso = (datetime.utcnow() + timedelta(days=30*months)).isoformat()
-                            update_range = f"Purchases!I{idx}:J{idx}"
-                            await sheets_values_update(SPREADSHEET_ID, update_range, [[activated_iso, expires_iso]])
+                            await sheets_values_update(SPREADSHEET_ID, f"Purchases!I{idx}:J{idx}", [[activated_iso, expires_iso]])
                             logger.info("Activated purchase row %d for user %s", idx, telegram_id)
                 except Exception as e:
                     logger.exception("Error processing purchase row %d: %s", idx, e)
@@ -458,8 +418,39 @@ async def poll_support_responses():
             logger.exception("poll_support_responses top-level error: %s", e)
         await asyncio.sleep(POLL_INTERVAL)
 
+# New: poll pending purchases and notify admin once per row (dedup)
+async def poll_pending_notify_admin():
+    global pending_notified_rows
+    while True:
+        try:
+            if ADMIN_TELEGRAM_ID:
+                data = await sheets_values_get(SPREADSHEET_ID, "Purchases!A2:K")
+                rows = data.get("values", []) if data else []
+                current_pending = set()
+                for idx, r in enumerate(rows, start=2):
+                    status = r[6].strip().lower() if len(r) > 6 and r[6] else ""
+                    if status in ("pending", "awaiting", "payment"):
+                        current_pending.add(idx)
+                        if idx not in pending_notified_rows:
+                            # send summary for this pending row
+                            telegram_id = r[0] if len(r) > 0 else ""
+                            full_name = r[1] if len(r) > 1 else ""
+                            product = r[3] if len(r) > 3 else ""
+                            txn = r[5] if len(r) > 5 else ""
+                            msg = f"🔔 Pending Purchase (row {idx})\nUser: {full_name} ({telegram_id})\nProduct: {product}\nTransaction info: {txn}\nUse /confirm {idx} to approve."
+                            try:
+                                await bot.send_message(ADMIN_TELEGRAM_ID, msg)
+                                pending_notified_rows.add(idx)
+                            except Exception:
+                                logger.exception("Failed to notify admin about pending row %d", idx)
+                # remove rows no longer pending from notified set
+                pending_notified_rows = {i for i in pending_notified_rows if i in current_pending}
+        except Exception as e:
+            logger.exception("poll_pending_notify_admin error: %s", e)
+        await asyncio.sleep(60)
+
 # -------------------------
-# User flow state (simple in-memory)
+# User flow state
 # -------------------------
 user_flow_state: Dict[int, Dict[str, Any]] = {}
 def get_state(user_id: int) -> Dict[str, Any]:
@@ -478,13 +469,11 @@ def build_main_keyboard() -> types.ReplyKeyboardMarkup:
 async def on_start(message: types.Message):
     uid = message.from_user.id
     await ensure_sheets_and_headers()
-    # If user exists in Users sheet -> send menu directly
     u = await find_user_row(uid)
     if u:
         get_state(uid)["stage"] = "main"
         await message.answer("👋 خوش آمدید مجدد! من شما را شناختم. از منوی زیر انتخاب کنید:", reply_markup=build_main_keyboard())
         return
-    # else check required channels
     missing = []
     for ch in REQUIRED_CHANNELS_LIST:
         member = await is_member_of(ch, uid)
@@ -510,7 +499,6 @@ async def receive_email(message: types.Message):
     email = message.text.strip()
     u = await find_user_row(uid)
     if u:
-        # update row
         row = u["row"]
         full_name = message.from_user.full_name or (row[1] if len(row)>1 else "")
         registered_at = row[3] if len(row)>3 and row[3] else datetime.utcnow().isoformat()
@@ -520,7 +508,6 @@ async def receive_email(message: types.Message):
         new_row = [uid, full_name, email, registered_at, referrer, referral_code, notes]
         await update_user_row(u["row_index"], new_row)
     else:
-        # append new
         await sheets_values_append(SPREADSHEET_ID, "Users!A:G", [uid, message.from_user.full_name, email, datetime.utcnow().isoformat(), "", "", "registered"])
     get_state(uid)["stage"] = "awaiting_referral"
     await message.answer("✅ ایمیل ثبت شد.\nاگر کد معرف دارید آن را وارد کنید؛ در غیر این صورت 'ندارم' را بنویسید.")
@@ -551,18 +538,16 @@ async def handle_test_channel(message: types.Message):
     if not CHANNEL_TEST:
         await message.answer("کانال تست تنظیم نشده است. با مدیر تماس بگیرید.")
         return
-    # create invite (1 member, expire short)
     link = await create_invite_link(CHANNEL_TEST, expire_seconds=60*60, member_limit=1)
     if not link:
         await message.answer("خطا در ایجاد لینک دعوت؛ لطفاً بعداً تلاش کنید.")
         return
     await message.answer("✅ لینک تست ساخته شد — لطفاً با کلیک روی لینک وارد کانال تست شوید. شما ۱۰ دقیقه آنجا خواهید بود.")
     await message.answer(link)
-    # watcher: check for join within a monitoring window (e.g., 20 minutes), and schedule removal 10 minutes after join.
     async def wait_for_join_and_schedule():
         joined = False
         join_time = None
-        monitor_seconds = 20 * 60  # monitor 20 minutes to detect join (covers cases user joins after link expired)
+        monitor_seconds = 20 * 60
         poll_interval = 8
         end_time = time.time() + monitor_seconds
         while time.time() < end_time:
@@ -573,14 +558,11 @@ async def handle_test_channel(message: types.Message):
             await asyncio.sleep(poll_interval)
         if joined and join_time:
             expires = join_time + timedelta(minutes=10)
-            # record trial in Purchases sheet
             try:
                 await sheets_values_append(SPREADSHEET_ID, "Purchases!A:K", [uid, message.from_user.full_name, "", "trial", "0", "trial", "activated", join_time.isoformat(), join_time.isoformat(), expires.isoformat(), ""])
             except Exception:
                 logger.exception("Failed to append trial purchase")
-            # schedule removal using BAN strategy to prevent rejoin via id/username
             await schedule_removal(uid, CHANNEL_TEST, expires)
-            # notify
             try:
                 await bot.send_message(uid, "🎉 شما به کانال تست اضافه شدید. مدت تست: ۱۰ دقیقه. پس از پایان حذف خواهید شد.")
             except Exception:
@@ -647,8 +629,7 @@ async def fallback(message: types.Message):
         await message.answer("در این مرحله منتظر اطلاعات مورد نیاز هستیم. اگر می‌خواهید از ابتدا شروع کنید /start را ارسال کنید.")
 
 # -------------------------
-# Admin helper: confirm purchase via bot
-# Usage: /confirm <row_number>  (row number in Purchases sheet)
+# Admin commands
 # -------------------------
 @dp.message_handler(commands=["confirm"])
 async def admin_confirm(message: types.Message):
@@ -661,7 +642,6 @@ async def admin_confirm(message: types.Message):
         return
     try:
         row_num = int(parts[1])
-        # read single row from Purchases
         rng = f"Purchases!A{row_num}:K{row_num}"
         data = await sheets_values_get(SPREADSHEET_ID, rng)
         vals = data.get("values", []) if data else []
@@ -672,21 +652,50 @@ async def admin_confirm(message: types.Message):
         telegram_id = int(r[0]) if len(r)>0 and str(r[0]).isdigit() else None
         product = r[3] if len(r)>3 else None
         if telegram_id and product:
-            # set status to confirmed and activate immediately
             await sheets_values_update(SPREADSHEET_ID, f"Purchases!G{row_num}:G{row_num}", [["confirmed"]])
             await activate_subscription_for_user(telegram_id, product, months=6)
             activated_iso = datetime.utcnow().isoformat()
             expires_iso = (datetime.utcnow() + timedelta(days=30*6)).isoformat()
             await sheets_values_update(SPREADSHEET_ID, f"Purchases!I{row_num}:J{row_num}", [[activated_iso, expires_iso]])
             await message.answer(f"خرید ردیف {row_num} برای کاربر {telegram_id} فعال شد.")
+            # remove from pending_notified_rows if present
+            try:
+                pending_notified_rows.discard(row_num)
+            except Exception:
+                pass
         else:
             await message.answer("اطلاعات کاربر یا محصول معتبر نیست.")
     except Exception as e:
         logger.exception("admin_confirm error: %s", e)
         await message.answer("خطا در پردازش درخواست.")
 
+@dp.message_handler(commands=["list_pending"])
+async def admin_list_pending(message: types.Message):
+    if ADMIN_TELEGRAM_ID is None or message.from_user.id != ADMIN_TELEGRAM_ID:
+        await message.answer("فقط ادمین مجاز است.")
+        return
+    try:
+        data = await sheets_values_get(SPREADSHEET_ID, "Purchases!A2:K")
+        rows = data.get("values", []) if data else []
+        lines = []
+        for idx, r in enumerate(rows, start=2):
+            status = r[6].strip().lower() if len(r) > 6 and r[6] else ""
+            if status in ("pending", "awaiting", "payment"):
+                telegram_id = r[0] if len(r)>0 else ""
+                full_name = r[1] if len(r)>1 else ""
+                product = r[3] if len(r)>3 else ""
+                txn = r[5] if len(r)>5 else ""
+                lines.append(f"{idx}: {full_name} ({telegram_id}) - {product} - {txn}")
+        if not lines:
+            await message.answer("ردیف پندینگ وجود ندارد.")
+        else:
+            await message.answer("Pending purchases:\n" + "\n".join(lines))
+    except Exception as e:
+        logger.exception("list_pending error: %s", e)
+        await message.answer("خطا در خواندن پندینگ‌ها.")
+
 # -------------------------
-# Health server & startup tasks
+# Health server & restore schedules
 # -------------------------
 async def start_webserver():
     app = web.Application()
@@ -707,17 +716,36 @@ async def rebuild_schedules_from_subscriptions():
             try:
                 telegram_id = int(r[0]) if len(r)>0 and str(r[0]).isdigit() else None
                 product = r[1] if len(r)>1 else None
-                expires_at = r[3] if len(r)>3 else None
-                if telegram_id and expires_at:
-                    expires_dt = datetime.fromisoformat(expires_at)
-                    if expires_dt > datetime.utcnow():
-                        if product == "normal" and CHANNEL_NORMAL:
+                # expires_at might be missing or malformed; try to find a parseable ISO string in row
+                expires_at = None
+                # check common columns that may contain iso datetime
+                candidates = []
+                if len(r) > 3:
+                    candidates.append(r[3])
+                # also look through entire row for iso-like strings
+                candidates.extend([item for item in r if isinstance(item, str)])
+                parsed = None
+                for cand in candidates:
+                    if not cand or not isinstance(cand, str):
+                        continue
+                    try:
+                        parsed_dt = datetime.fromisoformat(cand)
+                        parsed = parsed_dt
+                        break
+                    except Exception:
+                        continue
+                if not parsed:
+                    # nothing to schedule for this row
+                    continue
+                expires_dt = parsed
+                if telegram_id and expires_dt > datetime.utcnow():
+                    if product == "normal" and CHANNEL_NORMAL:
+                        await schedule_removal(telegram_id, CHANNEL_NORMAL, expires_dt)
+                    elif product == "premium":
+                        if CHANNEL_NORMAL:
                             await schedule_removal(telegram_id, CHANNEL_NORMAL, expires_dt)
-                        elif product == "premium":
-                            if CHANNEL_NORMAL:
-                                await schedule_removal(telegram_id, CHANNEL_NORMAL, expires_dt)
-                            if CHANNEL_PREMIUM:
-                                await schedule_removal(telegram_id, CHANNEL_PREMIUM, expires_dt)
+                        if CHANNEL_PREMIUM:
+                            await schedule_removal(telegram_id, CHANNEL_PREMIUM, expires_dt)
             except Exception as e:
                 logger.exception("rebuild row err: %s", e)
     except Exception as e:
@@ -737,6 +765,7 @@ async def on_startup(dp_object):
         asyncio.create_task(poll_purchases_and_activate())
         asyncio.create_task(poll_support_responses())
         asyncio.create_task(rebuild_schedules_from_subscriptions())
+        asyncio.create_task(poll_pending_notify_admin())
     except Exception as e:
         logger.exception("Failed to start background tasks: %s", e)
 
