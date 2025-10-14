@@ -1,17 +1,12 @@
 # main.py
-# نسخهٔ کامل و عملیاتی — همه‌ی جزئیات مورد درخواست پیاده‌سازی شده
-# - خواندن Google credentials از env یا فایل
-# - پشتیبانی از BOT_TOKEN / TELEGRAM_TOKEN
-# - نوشتن امن در Google Sheets (run_in_executor)
-# - حذف webhook و drop_pending_updates
-# - health endpoint با aiohttp
-# - ساخت خودکار شیت‌ها و هدرها
-# - ثبت ایمیل، رفرال، خرید، تیکت پشتیبانی
-# - تولید کد رفرال، ارسال لینک دعوت، عضویت تست 10 دقیقه‌ای با زمانبندی حذف
-# - فعال‌سازی اشتراک (normal / premium) با ثبت در شیت و زمانبندی حذف
-# - poll کننده برای فعال‌سازی خریدهای تاییدشده و ارسال پاسخ پشتیبانی
-# - مدیریت خطا، retry، backoff و لاگ کامل
-# کاملاً آمادهٔ deploy روی Render یا اجرا محلی پس از تنظیم متغیرهای محیطی.
+# نسخهٔ به‌روزشده با اصلاحات:
+# - تولید کد رفرال فقط بعد از اولین خرید تاییدشده
+# - شناسایی کاربر موجود (اگر ربات پاک شده دوباره) و نمایش منو بدون درخواست ایمیل
+# - حذف (بَن) کاربر پس از پایان تست و جلوگیری از ورود مجدد از طریق آی‌دی/یوزرنیم
+# - پیام‌رسانی بعد از حذف و هدایت به خرید
+# - اصلاح ستون‌بندی Users و به‌روزرسانی ردیف به جای append تکراری
+# - امکان تأیید خرید از طریق شیت یا دستور ادمین /confirm <row_num>
+# - همهٔ اصلاحات قبلی حفظ شده‌اند
 
 import os
 import json
@@ -45,12 +40,11 @@ GOOGLE_CREDENTIALS_ENV = os.getenv("GOOGLE_CREDENTIALS")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT", "service-account.json")
 PORT = int(os.getenv("PORT", "8000"))
 
-# Channels and admin
-REQUIRED_CHANNELS = os.getenv("REQUIRED_CHANNELS", "")  # comma-separated IDs or @usernames
-CHANNEL_TEST = os.getenv("CHANNEL_TEST", "")            # id or @username
+REQUIRED_CHANNELS = os.getenv("REQUIRED_CHANNELS", "")  # comma-separated
+CHANNEL_TEST = os.getenv("CHANNEL_TEST", "")
 CHANNEL_NORMAL = os.getenv("CHANNEL_NORMAL", "")
 CHANNEL_PREMIUM = os.getenv("CHANNEL_PREMIUM", "")
-ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")      # optional admin notification
+ADMIN_TELEGRAM_ID = int(os.getenv("ADMIN_TELEGRAM_ID")) if os.getenv("ADMIN_TELEGRAM_ID") else None
 
 # Basic validation
 if not TOKEN:
@@ -66,17 +60,14 @@ if not SPREADSHEET_ID:
 def load_google_creds() -> Dict[str, Any]:
     if GOOGLE_CREDENTIALS_ENV:
         s = GOOGLE_CREDENTIALS_ENV.strip()
-        # try raw JSON
         try:
             data = json.loads(s)
             logger.info("Loaded Google credentials from GOOGLE_CREDENTIALS (raw JSON).")
             return data
         except json.JSONDecodeError:
             logger.debug("GOOGLE_CREDENTIALS not raw JSON; attempt substring/base64.")
-        # try to extract JSON substring (if user pasted extra text)
         try:
-            start = s.find("{")
-            end = s.rfind("}")
+            start = s.find("{"); end = s.rfind("}")
             if start != -1 and end != -1 and end > start:
                 candidate = s[start:end+1]
                 data = json.loads(candidate)
@@ -84,7 +75,6 @@ def load_google_creds() -> Dict[str, Any]:
                 return data
         except Exception as e:
             logger.debug("recover substring failed: %s", e)
-        # try base64
         try:
             decoded = base64.b64decode(s, validate=True)
             data = json.loads(decoded.decode("utf-8"))
@@ -92,8 +82,6 @@ def load_google_creds() -> Dict[str, Any]:
             return data
         except Exception as e:
             logger.debug("base64 decode parse failed: %s", e)
-
-    # fallback to file
     if os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
         try:
             with open(GOOGLE_SERVICE_ACCOUNT_FILE, "r", encoding="utf-8") as f:
@@ -102,7 +90,6 @@ def load_google_creds() -> Dict[str, Any]:
                 return data
         except Exception as e:
             logger.exception("Failed to load/parse GOOGLE_SERVICE_ACCOUNT file '%s': %s", GOOGLE_SERVICE_ACCOUNT_FILE, e)
-
     logger.error("No valid Google credentials found. Provide GOOGLE_CREDENTIALS or upload service-account.json.")
     raise SystemExit("Missing Google credentials")
 
@@ -126,7 +113,7 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
 
 # -------------------------
-# Helper wrappers for blocking Sheets calls (run in executor)
+# Sheets blocking wrappers (executor)
 # -------------------------
 def _sheets_get_meta(spreadsheet_id: str):
     return sheets.get(spreadsheetId=spreadsheet_id).execute()
@@ -157,21 +144,17 @@ async def run_in_executor(func, *args, retries: int = 2, delay: float = 1.0):
 
 async def sheets_meta(spreadsheet_id: str):
     return await run_in_executor(_sheets_get_meta, spreadsheet_id)
-
 async def sheets_values_get(spreadsheet_id: str, range_name: str):
     return await run_in_executor(_sheets_values_get, spreadsheet_id, range_name)
-
 async def sheets_values_append(spreadsheet_id: str, range_name: str, row: List[Any]):
     return await run_in_executor(_sheets_values_append, spreadsheet_id, range_name, [row])
-
 async def sheets_values_update(spreadsheet_id: str, range_name: str, rows: List[List[Any]], value_input_option="RAW"):
     return await run_in_executor(_sheets_values_update, spreadsheet_id, range_name, rows, value_input_option)
-
 async def sheets_batch_update(spreadsheet_id: str, body: Dict[str, Any]):
     return await run_in_executor(_sheets_batch_update, spreadsheet_id, body)
 
 # -------------------------
-# Default sheets & headers
+# Default sheet names & headers
 # -------------------------
 DEFAULT_SHEET_TITLES = ["Users", "Purchases", "Referrals", "Support", "Subscriptions"]
 DEFAULT_HEADERS = {
@@ -183,9 +166,6 @@ DEFAULT_HEADERS = {
 }
 
 async def ensure_sheets_and_headers() -> bool:
-    """
-    Create missing sheets and headers if necessary. Idempotent.
-    """
     if sheets is None:
         logger.error("sheets client not initialized.")
         return False
@@ -196,10 +176,8 @@ async def ensure_sheets_and_headers() -> bool:
         for title in DEFAULT_SHEET_TITLES:
             if title not in titles:
                 requests.append({"addSheet": {"properties": {"title": title}}})
-                logger.info("Will create sheet: %s", title)
         if requests:
             await sheets_batch_update(SPREADSHEET_ID, {"requests": requests})
-            # small sleep to let Google finalize
             await asyncio.sleep(0.5)
         # ensure headers
         for title in DEFAULT_SHEET_TITLES:
@@ -214,20 +192,74 @@ async def ensure_sheets_and_headers() -> bool:
         return False
 
 # -------------------------
-# Utilities: channels, parsing env
+# Helpers: parse required channels
 # -------------------------
 def parse_channel_list(s: str) -> List[str]:
     if not s:
         return []
     return [it.strip() for it in s.split(",") if it.strip()]
-
 REQUIRED_CHANNELS_LIST = parse_channel_list(REQUIRED_CHANNELS)
 
 # -------------------------
-# Referral code generator
+# Find user in Users sheet (returns row index - absolute)
+# -------------------------
+async def find_user_row(telegram_id: int) -> Optional[Dict[str, Any]]:
+    """
+    Returns dict {row_index:int, row:List[str]} or None
+    """
+    try:
+        data = await sheets_values_get(SPREADSHEET_ID, "Users!A2:G")
+        rows = data.get("values", []) if data else []
+        for idx, r in enumerate(rows, start=2):
+            if len(r) > 0 and str(r[0]) == str(telegram_id):
+                return {"row_index": idx, "row": r}
+        return None
+    except Exception as e:
+        logger.exception("find_user_row failed: %s", e)
+        return None
+
+async def update_user_row(row_index: int, row_values: List[Any]):
+    # ensure length matches headers
+    maxlen = len(DEFAULT_HEADERS["Users"])
+    row_values = (row_values + [""] * maxlen)[:maxlen]
+    range_name = f"Users!A{row_index}:{chr(65+maxlen-1)}{row_index}"
+    return await sheets_values_update(SPREADSHEET_ID, range_name, [row_values])
+
+# -------------------------
+# Referral generator (only after first confirmed purchase)
 # -------------------------
 def make_referral_code() -> str:
     return "R" + secrets.token_hex(4).upper()
+
+async def ensure_referral_for_user(telegram_id: int, user_full_name: str):
+    # check Referrals sheet for existing
+    try:
+        data = await sheets_values_get(SPREADSHEET_ID, "Referrals!A2:D")
+        rows = data.get("values", []) if data else []
+        for r in rows:
+            if len(r) > 0 and str(r[0]) == str(telegram_id):
+                # return existing code
+                return r[1] if len(r) > 1 else None
+        # not found -> create
+        code = make_referral_code()
+        await sheets_values_append(SPREADSHEET_ID, "Referrals!A:D", [telegram_id, code, 0, datetime.utcnow().isoformat()])
+        # also update Users sheet referral_code column if exists
+        u = await find_user_row(telegram_id)
+        if u:
+            row = u["row"]
+            # build row to update: keep existing fields but set referral_code
+            # columns: telegram_id, full_name, email, registered_at, referrer, referral_code, notes
+            full_name = row[1] if len(row) > 1 else user_full_name
+            email = row[2] if len(row) > 2 else ""
+            registered_at = row[3] if len(row) > 3 else datetime.utcnow().isoformat()
+            referrer = row[4] if len(row) > 4 else ""
+            notes = row[6] if len(row) > 6 else ""
+            new_row = [telegram_id, full_name, email, registered_at, referrer, code, notes]
+            await update_user_row(u["row_index"], new_row)
+        return code
+    except Exception as e:
+        logger.exception("ensure_referral_for_user failed: %s", e)
+        return None
 
 # -------------------------
 # Chat membership helpers
@@ -237,7 +269,6 @@ async def is_member_of(chat_id_or_username: str, user_id: int) -> bool:
         chat = int(chat_id_or_username) if str(chat_id_or_username).lstrip("-").isdigit() else chat_id_or_username
         member = await bot.get_chat_member(chat, user_id)
         status = getattr(member, "status", None) or (member.get("status") if isinstance(member, dict) else None)
-        logger.debug("get_chat_member(%s,%d) -> %s", chat_id_or_username, user_id, status)
         return status in ("member", "creator", "administrator")
     except TelegramAPIError as e:
         logger.warning("get_chat_member API error for %s user %d: %s", chat_id_or_username, user_id, e)
@@ -247,22 +278,15 @@ async def is_member_of(chat_id_or_username: str, user_id: int) -> bool:
         return False
 
 async def create_invite_link(chat_id_or_username: str, expire_seconds: Optional[int] = None, member_limit: Optional[int] = None) -> Optional[str]:
-    """
-    Create an invite link. Fallback to export_chat_invite_link if create_chat_invite_link not available.
-    Returns invite URL or None.
-    """
     try:
         chat = int(chat_id_or_username) if str(chat_id_or_username).lstrip("-").isdigit() else chat_id_or_username
-        # prefer create_chat_invite_link (newer API). aiogram may return ChatInviteLink object.
         params = {}
         if expire_seconds:
             params["expire_date"] = int(time.time()) + int(expire_seconds)
         if member_limit:
             params["member_limit"] = int(member_limit)
         try:
-            # some aiogram versions: create_chat_invite_link(chat_id, **params)
             link_obj = await bot.create_chat_invite_link(chat, **params) if params else await bot.create_chat_invite_link(chat)
-            # unify
             if isinstance(link_obj, str):
                 return link_obj
             if hasattr(link_obj, "invite_link"):
@@ -270,7 +294,6 @@ async def create_invite_link(chat_id_or_username: str, expire_seconds: Optional[
             if isinstance(link_obj, dict):
                 return link_obj.get("invite_link")
         except Exception:
-            # fallback to export_chat_invite_link (may return string)
             try:
                 link = await bot.export_chat_invite_link(chat)
                 return link
@@ -282,16 +305,13 @@ async def create_invite_link(chat_id_or_username: str, expire_seconds: Optional[
         return None
 
 # -------------------------
-# Scheduling removal tasks (in-memory)
+# Removal scheduling & banning strategy
 # -------------------------
-scheduled_tasks: Dict[str, asyncio.Task] = {}  # key: f"{telegram_id}:{chat}"
+# We'll BAN user on removal (prevent rejoin by username/ID). When activating subscription, we'll UNBAN before invite.
+scheduled_tasks: Dict[str, asyncio.Task] = {}
 
 async def schedule_removal(telegram_id: int, chat_id_or_username: str, when: datetime):
-    """
-    Schedule a ban (removal) at 'when'. We store tasks in memory; on restart subscriptions sheet can be used to rebuild schedules.
-    """
     key = f"{telegram_id}:{chat_id_or_username}"
-    # cancel previous if exists
     prev = scheduled_tasks.get(key)
     if prev and not prev.done():
         prev.cancel()
@@ -302,10 +322,21 @@ async def schedule_removal(telegram_id: int, chat_id_or_username: str, when: dat
         try:
             await asyncio.sleep(delay)
             chat = int(chat_id_or_username) if str(chat_id_or_username).lstrip("-").isdigit() else chat_id_or_username
-            # Ban to remove; use ban_chat_member (aiogram), may require bot admin
             try:
+                # Ban permanently (effectively). Admin can unban when activating subscription.
                 await bot.ban_chat_member(chat, telegram_id)
-                logger.info("Removed user %d from %s (ban)", telegram_id, chat_id_or_username)
+                logger.info("Banned (removed) user %d from %s", telegram_id, chat_id_or_username)
+                # mark in Subscriptions or Purchases sheet (optional)
+                try:
+                    await sheets_values_append(SPREADSHEET_ID, "Subscriptions!A:E", [telegram_id, chat_id_or_username, "", datetime.utcnow().isoformat(), "FALSE"])
+                except Exception:
+                    pass
+                # notify user and guide to purchase
+                try:
+                    await bot.send_message(telegram_id, "⏳ مدت تست شما به پایان رسید و از کانال حذف شدید. برای دسترسی کامل و اشتراک، از منوی ربات گزینهٔ خرید را انتخاب کنید.")
+                    await bot.send_message(telegram_id, "📌 برای خرید سریع: از منوی اصلی گزینهٔ 'خرید کانال معمولی' یا 'خرید کانال ویژه' را انتخاب کنید.")
+                except Exception:
+                    logger.exception("Failed to send removal notice to user %d", telegram_id)
             except Exception as e:
                 logger.exception("Failed to ban user %d from %s: %s", telegram_id, chat_id_or_username, e)
         except asyncio.CancelledError:
@@ -317,13 +348,9 @@ async def schedule_removal(telegram_id: int, chat_id_or_username: str, when: dat
     return task
 
 # -------------------------
-# Activate subscription: send invite links & record in Subscriptions sheet + schedule removal
+# Activate subscription (unban before invite)
 # -------------------------
 async def activate_subscription_for_user(telegram_id: int, product: str, months: int = 6):
-    """
-    product: "normal" or "premium"
-    months: duration
-    """
     channels_to_invite = []
     if product == "normal":
         if CHANNEL_NORMAL:
@@ -335,39 +362,54 @@ async def activate_subscription_for_user(telegram_id: int, product: str, months:
             channels_to_invite.append(CHANNEL_PREMIUM)
     activated_at = datetime.utcnow()
     expires_at = activated_at + timedelta(days=30 * months)
-    # For each channel, create invite link and send to user
+    # unban before inviting (in case previously banned)
     for ch in channels_to_invite:
         try:
-            link = await create_invite_link(ch, expire_seconds=60 * 60 * 24)  # 24h
+            chat = int(ch) if str(ch).lstrip("-").isdigit() else ch
+            try:
+                # unban to allow invite
+                await bot.unban_chat_member(chat, telegram_id)
+            except Exception:
+                # ignore if cannot unban or not banned
+                pass
+            link = await create_invite_link(ch, expire_seconds=60 * 60 * 24)
             if link:
-                await bot.send_message(telegram_id, f"✅ اشتراک شما برای کانال {ch} فعال شد. برای پیوستن از لینک زیر استفاده کنید:\n{link}")
+                await bot.send_message(telegram_id, f"✅ اشتراک شما برای کانال {ch} فعال شد. از لینک زیر برای پیوستن استفاده کنید:\n{link}")
             else:
-                await bot.send_message(telegram_id, f"✅ اشتراک شما فعال شد، اما نتوانستم لینک ایجاد کنم. لطفاً دستی عضو شوید: {ch}")
+                await bot.send_message(telegram_id, f"✅ اشتراک شما برای کانال {ch} فعال شد. اما لینک اتوماتیک ساخته نشد — لطفاً دستی عضو شوید: {ch}")
         except Exception as e:
             logger.exception("Error inviting user %d to %s: %s", telegram_id, ch, e)
-    # record in Subscriptions sheet
+    # record subscription
     try:
         await sheets_values_append(SPREADSHEET_ID, "Subscriptions!A:E", [telegram_id, product, activated_at.isoformat(), expires_at.isoformat(), "TRUE"])
     except Exception as e:
         logger.exception("Failed to write Subscriptions row: %s", e)
-    # schedule removal for each channel (we schedule removal on CHANNEL_NORMAL for normal, for premium schedule both)
+    # schedule removal (ban) at expires
     for ch in channels_to_invite:
         try:
             await schedule_removal(telegram_id, ch, expires_at)
         except Exception as e:
             logger.exception("Failed to schedule removal for %d from %s: %s", telegram_id, ch, e)
+    # ensure referral code generation (only now, since first confirmed purchase)
+    try:
+        # Get full name from Users sheet or fallback
+        u = await find_user_row(telegram_id)
+        full_name = u["row"][1] if u and len(u["row"]) > 1 else ""
+        code = await ensure_referral_for_user(telegram_id, full_name)
+        if code:
+            try:
+                await bot.send_message(telegram_id, f"🎉 خرید شما تایید شد! کد معرفی شما: `{code}`\nاین کد را به دوستانتان بدهید تا از پورسانت بهره‌مند شوید.", parse_mode="Markdown")
+            except Exception:
+                pass
+    except Exception as e:
+        logger.exception("Failed to ensure/give referral code: %s", e)
 
 # -------------------------
 # Background pollers
 # -------------------------
-POLL_INTERVAL = 20  # seconds
+POLL_INTERVAL = 20
 
 async def poll_purchases_and_activate():
-    """
-    Look for purchases with status 'confirmed' (case-insensitive) and not yet activated.
-    We'll read Purchases!A:K (headers assumed).
-    If a row has status confirmed and activated_at empty, activate subscription and write activated_at/expires_at.
-    """
     while True:
         try:
             data = await sheets_values_get(SPREADSHEET_ID, "Purchases!A2:K")
@@ -377,14 +419,13 @@ async def poll_purchases_and_activate():
                     status = r[6].strip().lower() if len(r) > 6 and r[6] else ""
                     activated_at = r[8] if len(r) > 8 and r[8] else ""
                     if status in ("confirmed", "approved") and not activated_at:
-                        telegram_id = int(r[0]) if len(r) > 0 and r[0].isdigit() else None
+                        telegram_id = int(r[0]) if len(r) > 0 and str(r[0]).isdigit() else None
                         product = r[3] if len(r) > 3 else None
                         months = 6
                         if telegram_id and product:
                             await activate_subscription_for_user(telegram_id, product, months=months)
                             activated_iso = datetime.utcnow().isoformat()
                             expires_iso = (datetime.utcnow() + timedelta(days=30*months)).isoformat()
-                            # update cells I (activated_at) and J (expires_at), columns are 9 and 10 -> I/J
                             update_range = f"Purchases!I{idx}:J{idx}"
                             await sheets_values_update(SPREADSHEET_ID, update_range, [[activated_iso, expires_iso]])
                             logger.info("Activated purchase row %d for user %s", idx, telegram_id)
@@ -395,10 +436,6 @@ async def poll_purchases_and_activate():
         await asyncio.sleep(POLL_INTERVAL)
 
 async def poll_support_responses():
-    """
-    Scan Support sheet for responses added by admin and send them to users.
-    When response present and status != 'responded', send message and mark status/responded_at.
-    """
     while True:
         try:
             data = await sheets_values_get(SPREADSHEET_ID, "Support!A2:I")
@@ -406,13 +443,12 @@ async def poll_support_responses():
             for idx, r in enumerate(rows, start=2):
                 try:
                     status = r[5].strip().lower() if len(r) > 5 and r[5] else ""
-                    telegram_id = int(r[1]) if len(r) > 1 and r[1].isdigit() else None
+                    telegram_id = int(r[1]) if len(r) > 1 and str(r[1]).isdigit() else None
                     response_text = r[7] if len(r) > 7 else ""
                     responded_at = r[8] if len(r) > 8 else ""
                     if response_text and status != "responded":
                         if telegram_id:
                             await bot.send_message(telegram_id, f"📬 پاسخ پشتیبانی:\n\n{response_text}")
-                        # mark responded and set responded_at
                         update_range = f"Support!F{idx}:I{idx}"
                         await sheets_values_update(SPREADSHEET_ID, update_range, [["responded", "", response_text, datetime.utcnow().isoformat()]])
                         logger.info("Sent support response for row %d", idx)
@@ -423,28 +459,32 @@ async def poll_support_responses():
         await asyncio.sleep(POLL_INTERVAL)
 
 # -------------------------
-# In-memory user flow state (simple)
+# User flow state (simple in-memory)
 # -------------------------
 user_flow_state: Dict[int, Dict[str, Any]] = {}
-
 def get_state(user_id: int) -> Dict[str, Any]:
     return user_flow_state.setdefault(user_id, {"stage": None})
 
-# -------------------------
-# Handlers: registration, referral, main menu, test, purchase, support, platform
-# -------------------------
 def build_main_keyboard() -> types.ReplyKeyboardMarkup:
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("تست کانال معمولی", "خرید کانال معمولی")
     kb.row("خرید کانال ویژه", "پشتیبانی", "توضیحات پلتفرم")
     return kb
 
+# -------------------------
+# Handlers
+# -------------------------
 @dp.message_handler(commands=["start"])
 async def on_start(message: types.Message):
     uid = message.from_user.id
-    # Ensure sheets exists
     await ensure_sheets_and_headers()
-    # Check required channels membership
+    # If user exists in Users sheet -> send menu directly
+    u = await find_user_row(uid)
+    if u:
+        get_state(uid)["stage"] = "main"
+        await message.answer("👋 خوش آمدید مجدد! من شما را شناختم. از منوی زیر انتخاب کنید:", reply_markup=build_main_keyboard())
+        return
+    # else check required channels
     missing = []
     for ch in REQUIRED_CHANNELS_LIST:
         member = await is_member_of(ch, uid)
@@ -461,7 +501,6 @@ async def on_start(message: types.Message):
         msg += "\nپس از عضویت، /start را مجدداً ارسال کنید."
         await message.answer(msg)
         return
-    # proceed to request email
     get_state(uid)["stage"] = "awaiting_email"
     await message.answer("👋 خوش آمدید!\nبرای ادامه لطفاً ایمیل خود را وارد کنید:", reply_markup=types.ReplyKeyboardRemove())
 
@@ -469,33 +508,42 @@ async def on_start(message: types.Message):
 async def receive_email(message: types.Message):
     uid = message.from_user.id
     email = message.text.strip()
-    st = get_state(uid)
-    st["email"] = email
-    st["stage"] = "awaiting_referral"
-    # Append basic user row (note: we'll also record referral later)
-    await sheets_values_append(SPREADSHEET_ID, "Users!A:G", [uid, message.from_user.full_name, email, datetime.utcnow().isoformat(), "", "", "registered"])
-    await message.answer("✅ ایمیل ثبت شد.\nاگر کد معرف دارید آن را وارد کنید، در غیر این صورت 'ندارم' را بنویسید.")
+    u = await find_user_row(uid)
+    if u:
+        # update row
+        row = u["row"]
+        full_name = message.from_user.full_name or (row[1] if len(row)>1 else "")
+        registered_at = row[3] if len(row)>3 and row[3] else datetime.utcnow().isoformat()
+        referrer = row[4] if len(row)>4 else ""
+        referral_code = row[5] if len(row)>5 else ""
+        notes = row[6] if len(row)>6 else ""
+        new_row = [uid, full_name, email, registered_at, referrer, referral_code, notes]
+        await update_user_row(u["row_index"], new_row)
+    else:
+        # append new
+        await sheets_values_append(SPREADSHEET_ID, "Users!A:G", [uid, message.from_user.full_name, email, datetime.utcnow().isoformat(), "", "", "registered"])
+    get_state(uid)["stage"] = "awaiting_referral"
+    await message.answer("✅ ایمیل ثبت شد.\nاگر کد معرف دارید آن را وارد کنید؛ در غیر این صورت 'ندارم' را بنویسید.")
 
 @dp.message_handler(lambda m: get_state(m.from_user.id).get("stage") == "awaiting_referral" and m.text)
 async def receive_referral(message: types.Message):
     uid = message.from_user.id
     text = message.text.strip()
-    st = get_state(uid)
-    ref_provided = ""
-    if text.lower() in ("ندارم", "ندار", "no", "none", "skip"):
-        ref_provided = ""
+    ref_provided = "" if text.lower() in ("ندارم","ندار","no","none","skip") else text
+    u = await find_user_row(uid)
+    if u:
+        row = u["row"]
+        full_name = row[1] if len(row)>1 else message.from_user.full_name
+        email = row[2] if len(row)>2 else ""
+        registered_at = row[3] if len(row)>3 else datetime.utcnow().isoformat()
+        referral_code = row[5] if len(row)>5 else ""
+        notes = row[6] if len(row)>6 else ""
+        new_row = [uid, full_name, email, registered_at, ref_provided, referral_code, notes]
+        await update_user_row(u["row_index"], new_row)
     else:
-        ref_provided = text.strip()
-    # generate own referral code
-    my_code = make_referral_code()
-    st["referrer"] = ref_provided
-    st["my_referral_code"] = my_code
-    st["stage"] = "main"
-    # save referral info
-    await sheets_values_append(SPREADSHEET_ID, "Referrals!A:D", [uid, my_code, 0, datetime.utcnow().isoformat()])
-    # update Users sheet: append another row noting referral (simpler than find+update)
-    await sheets_values_append(SPREADSHEET_ID, "Users!A:G", [uid, message.from_user.full_name, st.get("email", ""), datetime.utcnow().isoformat(), ref_provided, my_code, "complete"])
-    await message.answer(f"✅ ثبت شد. کد رفرال شما: {my_code}\nلطفاً از منوی زیر انتخاب کنید:", reply_markup=build_main_keyboard())
+        await sheets_values_append(SPREADSHEET_ID, "Users!A:G", [uid, message.from_user.full_name, "", datetime.utcnow().isoformat(), ref_provided, "", "registered"])
+    get_state(uid)["stage"] = "main"
+    await message.answer("✅ ثبت شد. اکنون می‌توانید از منو استفاده کنید:", reply_markup=build_main_keyboard())
 
 @dp.message_handler(lambda m: m.text == "تست کانال معمولی")
 async def handle_test_channel(message: types.Message):
@@ -503,61 +551,69 @@ async def handle_test_channel(message: types.Message):
     if not CHANNEL_TEST:
         await message.answer("کانال تست تنظیم نشده است. با مدیر تماس بگیرید.")
         return
-    # create a one-time invite link limited to 1 member and 1 hour expiry
+    # create invite (1 member, expire short)
     link = await create_invite_link(CHANNEL_TEST, expire_seconds=60*60, member_limit=1)
     if not link:
-        await message.answer("خطا در ایجاد لینک دعوت؛ لطفاً بعداً تلاش کنید یا با مدیر تماس بگیرید.")
+        await message.answer("خطا در ایجاد لینک دعوت؛ لطفاً بعداً تلاش کنید.")
         return
-    await message.answer("✅ لینک تست ساخته شد — لطفاً با کلیک روی لینک وارد کانال تست شوید. شما 10 دقیقه آنجا خواهید بود.")
+    await message.answer("✅ لینک تست ساخته شد — لطفاً با کلیک روی لینک وارد کانال تست شوید. شما ۱۰ دقیقه آنجا خواهید بود.")
     await message.answer(link)
-    # background poll for join then schedule removal
+    # watcher: check for join within a monitoring window (e.g., 20 minutes), and schedule removal 10 minutes after join.
     async def wait_for_join_and_schedule():
-        # check membership up to 5 minutes (30 checks every 10s)
-        for _ in range(30):
+        joined = False
+        join_time = None
+        monitor_seconds = 20 * 60  # monitor 20 minutes to detect join (covers cases user joins after link expired)
+        poll_interval = 8
+        end_time = time.time() + monitor_seconds
+        while time.time() < end_time:
             if await is_member_of(CHANNEL_TEST, uid):
-                # record trial in Purchases sheet
-                now = datetime.utcnow()
-                expires = now + timedelta(minutes=10)
-                await sheets_values_append(SPREADSHEET_ID, "Purchases!A:K", [uid, message.from_user.full_name, "", "trial", "0", "trial", "activated", now.isoformat(), now.isoformat(), expires.isoformat(), ""])
-                # notify user
-                try:
-                    await bot.send_message(uid, f"🎉 شما به کانال تست اضافه شدید. مدت: 10 دقیقه. پس از پایان عضویت حذف خواهید شد.")
-                except Exception:
-                    pass
-                # schedule removal
-                await schedule_removal(uid, CHANNEL_TEST, expires)
-                return
-            await asyncio.sleep(10)
-        # if not joined
-        try:
-            await bot.send_message(uid, "⚠️ به نظر می‌رسد که شما عضو کانال تست نشدید. لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
-        except Exception:
-            pass
+                joined = True
+                join_time = datetime.utcnow()
+                break
+            await asyncio.sleep(poll_interval)
+        if joined and join_time:
+            expires = join_time + timedelta(minutes=10)
+            # record trial in Purchases sheet
+            try:
+                await sheets_values_append(SPREADSHEET_ID, "Purchases!A:K", [uid, message.from_user.full_name, "", "trial", "0", "trial", "activated", join_time.isoformat(), join_time.isoformat(), expires.isoformat(), ""])
+            except Exception:
+                logger.exception("Failed to append trial purchase")
+            # schedule removal using BAN strategy to prevent rejoin via id/username
+            await schedule_removal(uid, CHANNEL_TEST, expires)
+            # notify
+            try:
+                await bot.send_message(uid, "🎉 شما به کانال تست اضافه شدید. مدت تست: ۱۰ دقیقه. پس از پایان حذف خواهید شد.")
+            except Exception:
+                pass
+        else:
+            try:
+                await bot.send_message(uid, "⚠️ شما وارد کانال تست نشدید. لطفاً دوباره تلاش کنید یا با پشتیبانی تماس بگیرید.")
+            except Exception:
+                pass
     asyncio.create_task(wait_for_join_and_schedule())
 
 @dp.message_handler(lambda m: m.text == "خرید کانال معمولی")
 async def handle_buy_normal(message: types.Message):
     uid = message.from_user.id
     get_state(uid)["stage"] = "awaiting_payment_normal"
-    await message.answer("💳 لطفاً مبلغ مربوط به کانال معمولی را به کارت زیر واریز کنید:\n`6037-9917-1234-5678`\nپس از پرداخت، اطلاعات تراکنش (شناسه، تاریخ، مبلغ و 4 رقم آخر کارت) را ارسال کنید.")
+    await message.answer("💳 مبلغ مربوط به کانال معمولی را واریز کنید به:\n`6037-9917-1234-5678`\nسپس اطلاعات تراکنش را ارسال کنید.")
 
 @dp.message_handler(lambda m: m.text == "خرید کانال ویژه")
 async def handle_buy_premium(message: types.Message):
     uid = message.from_user.id
     get_state(uid)["stage"] = "awaiting_payment_premium"
-    await message.answer("💳 لطفاً مبلغ مربوط به کانال ویژه را به کارت زیر واریز کنید:\n`6037-9917-1234-5678`\nپس از پرداخت، اطلاعات تراکنش را ارسال کنید. پس از تایید توسط مدیر، شما در هر دو کانال عضو خواهید شد.")
+    await message.answer("💳 مبلغ مربوط به کانال ویژه را واریز کنید به:\n`6037-9917-1234-5678`\nسپس اطلاعات تراکنش را ارسال کنید.")
 
-@dp.message_handler(lambda m: get_state(m.from_user.id).get("stage") in ("awaiting_payment_normal", "awaiting_payment_premium") and m.text)
+@dp.message_handler(lambda m: get_state(m.from_user.id).get("stage") in ("awaiting_payment_normal","awaiting_payment_premium") and m.text)
 async def receive_payment_info(message: types.Message):
     uid = message.from_user.id
     st = get_state(uid)
     stage = st.get("stage")
     product = "normal" if stage == "awaiting_payment_normal" else "premium"
     txn_info = message.text.strip()
-    # Append purchase as pending
-    await sheets_values_append(SPREADSHEET_ID, "Purchases!A:K", [uid, message.from_user.full_name, st.get("email", ""), product, "", txn_info, "pending", datetime.utcnow().isoformat(), "", "", ""])
+    await sheets_values_append(SPREADSHEET_ID, "Purchases!A:K", [uid, message.from_user.full_name, st.get("email",""), product, "", txn_info, "pending", datetime.utcnow().isoformat(), "", "", ""])
     st["stage"] = "main"
-    await message.answer("✅ اطلاعات تراکنش شما ثبت شد. پس از تایید مدیریت، اشتراک شما فعال خواهد شد.")
+    await message.answer("✅ اطلاعات تراکنش شما ثبت شد. پس از تأیید مدیریت اشتراک شما فعال خواهد شد.")
 
 @dp.message_handler(lambda m: m.text == "پشتیبانی")
 async def support_start(message: types.Message):
@@ -572,15 +628,13 @@ async def support_receive(message: types.Message):
     ticket_id = f"T{int(time.time())}{uid%1000}"
     await sheets_values_append(SPREADSHEET_ID, "Support!A:I", [ticket_id, uid, message.from_user.full_name, "پشتیبانی", body, "open", datetime.utcnow().isoformat(), "", ""])
     get_state(uid)["stage"] = "main"
-    await message.answer(f"✅ تیکت ثبت شد. شناسه: {ticket_id}\nپاسخ مدیریت در همین صفحه در قسمت پاسخ درج خواهد شد و برای شما ارسال می‌شود.")
+    await message.answer(f"✅ تیکت ثبت شد. شناسه: {ticket_id}\nپاسخ مدیریت در همین شیت درج و برای شما ارسال خواهد شد.")
 
 @dp.message_handler(lambda m: m.text == "توضیحات پلتفرم")
 async def platform_info(message: types.Message):
-    PLATFORM_TEXT = (
-        "📘 توضیحات پلتفرم:\n\n"
-        "این ربات برای مدیریت اشتراک کانال‌های آموزشی طراحی شده است. "
-        "ثبت ایمیل و عضویت در کانال‌ها الزامی است. خریدها توسط مدیریت در شیت تایید می‌شوند."
-    )
+    PLATFORM_TEXT = ("📘 توضیحات پلتفرم:\n\n"
+                     "این ربات برای مدیریت اشتراک کانال‌های آموزشی طراحی شده است.\n"
+                     "ثبت ایمیل و عضویت در کانال‌ها الزامی است. خریدها توسط مدیریت در شیت تأیید می‌شوند.")
     await message.answer(PLATFORM_TEXT)
 
 @dp.message_handler(lambda m: True)
@@ -593,7 +647,46 @@ async def fallback(message: types.Message):
         await message.answer("در این مرحله منتظر اطلاعات مورد نیاز هستیم. اگر می‌خواهید از ابتدا شروع کنید /start را ارسال کنید.")
 
 # -------------------------
-# Health server
+# Admin helper: confirm purchase via bot
+# Usage: /confirm <row_number>  (row number in Purchases sheet)
+# -------------------------
+@dp.message_handler(commands=["confirm"])
+async def admin_confirm(message: types.Message):
+    if ADMIN_TELEGRAM_ID is None or message.from_user.id != ADMIN_TELEGRAM_ID:
+        await message.answer("فقط ادمین مجاز است.")
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("فرمت: /confirm <row_number>")
+        return
+    try:
+        row_num = int(parts[1])
+        # read single row from Purchases
+        rng = f"Purchases!A{row_num}:K{row_num}"
+        data = await sheets_values_get(SPREADSHEET_ID, rng)
+        vals = data.get("values", []) if data else []
+        if not vals:
+            await message.answer("ردیف پیدا نشد.")
+            return
+        r = vals[0]
+        telegram_id = int(r[0]) if len(r)>0 and str(r[0]).isdigit() else None
+        product = r[3] if len(r)>3 else None
+        if telegram_id and product:
+            # set status to confirmed and activate immediately
+            await sheets_values_update(SPREADSHEET_ID, f"Purchases!G{row_num}:G{row_num}", [["confirmed"]])
+            await activate_subscription_for_user(telegram_id, product, months=6)
+            activated_iso = datetime.utcnow().isoformat()
+            expires_iso = (datetime.utcnow() + timedelta(days=30*6)).isoformat()
+            await sheets_values_update(SPREADSHEET_ID, f"Purchases!I{row_num}:J{row_num}", [[activated_iso, expires_iso]])
+            await message.answer(f"خرید ردیف {row_num} برای کاربر {telegram_id} فعال شد.")
+        else:
+            await message.answer("اطلاعات کاربر یا محصول معتبر نیست.")
+    except Exception as e:
+        logger.exception("admin_confirm error: %s", e)
+        await message.answer("خطا در پردازش درخواست.")
+
+# -------------------------
+# Health server & startup tasks
 # -------------------------
 async def start_webserver():
     app = web.Application()
@@ -606,25 +699,18 @@ async def start_webserver():
     await site.start()
     logger.info("Health server started on port %s", PORT)
 
-# -------------------------
-# On startup: webhook delete, ensure sheets, start polls & health server, rebuild schedules
-# -------------------------
 async def rebuild_schedules_from_subscriptions():
     try:
         data = await sheets_values_get(SPREADSHEET_ID, "Subscriptions!A2:E")
         rows = data.get("values", []) if data else []
         for r in rows:
             try:
-                telegram_id = int(r[0]) if len(r) > 0 and str(r[0]).isdigit() else None
-                product = r[1] if len(r) > 1 else None
-                activated_at = r[2] if len(r) > 2 else None
-                expires_at = r[3] if len(r) > 3 else None
-                active = r[4] if len(r) > 4 else ""
+                telegram_id = int(r[0]) if len(r)>0 and str(r[0]).isdigit() else None
+                product = r[1] if len(r)>1 else None
+                expires_at = r[3] if len(r)>3 else None
                 if telegram_id and expires_at:
                     expires_dt = datetime.fromisoformat(expires_at)
-                    # schedule removal if expires in future
                     if expires_dt > datetime.utcnow():
-                        # choose channel to remove depending on product (approx)
                         if product == "normal" and CHANNEL_NORMAL:
                             await schedule_removal(telegram_id, CHANNEL_NORMAL, expires_dt)
                         elif product == "premium":
@@ -633,41 +719,27 @@ async def rebuild_schedules_from_subscriptions():
                             if CHANNEL_PREMIUM:
                                 await schedule_removal(telegram_id, CHANNEL_PREMIUM, expires_dt)
             except Exception as e:
-                logger.exception("rebuild_schedules_from_subscriptions row error: %s", e)
+                logger.exception("rebuild row err: %s", e)
     except Exception as e:
-        logger.exception("Failed to rebuild schedules: %s", e)
+        logger.exception("rebuild_schedules failed: %s", e)
 
 async def on_startup(dp_object):
-    # remove webhook to prevent conflict with polling
     try:
         await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook deleted (drop_pending_updates=True)")
+        logger.info("Webhook deleted on startup.")
     except Exception as e:
-        logger.exception("Failed to delete webhook on startup: %s", e)
-    # ensure sheets and headers
+        logger.exception("delete_webhook failed: %s", e)
     ok = await ensure_sheets_and_headers()
     if not ok:
-        logger.warning("ensure_sheets_and_headers returned False; proceeding but some features may fail.")
-    # start health server
+        logger.warning("ensure_sheets_and_headers returned False.")
     try:
         asyncio.create_task(start_webserver())
-    except Exception as e:
-        logger.exception("Failed to start webserver: %s", e)
-    # start background pollers
-    try:
         asyncio.create_task(poll_purchases_and_activate())
         asyncio.create_task(poll_support_responses())
-    except Exception as e:
-        logger.exception("Failed to start pollers: %s", e)
-    # rebuild scheduled removals from subscriptions sheet
-    try:
         asyncio.create_task(rebuild_schedules_from_subscriptions())
     except Exception as e:
-        logger.exception("Failed to rebuild schedules: %s", e)
+        logger.exception("Failed to start background tasks: %s", e)
 
-# -------------------------
-# Robust polling main (handle TerminatedByOtherGetUpdates)
-# -------------------------
 def run_polling_with_retries(skip_updates: bool = True, max_retries: int = 20):
     attempt = 0
     while True:
@@ -675,29 +747,24 @@ def run_polling_with_retries(skip_updates: bool = True, max_retries: int = 20):
         try:
             logger.info("Starting polling (attempt %d)...", attempt)
             executor.start_polling(dp, skip_updates=skip_updates, on_startup=on_startup)
-            logger.info("executor.start_polling returned normally.")
             break
         except TerminatedByOtherGetUpdates as e:
             wait = min(60, 5 * attempt)
-            logger.warning("TerminatedByOtherGetUpdates detected: %s — sleeping %d seconds", e, wait)
+            logger.warning("TerminatedByOtherGetUpdates: %s — sleeping %d", e, wait)
             time.sleep(wait)
             if attempt >= max_retries:
-                logger.error("Max retries reached for TerminatedByOtherGetUpdates. Exiting.")
+                logger.error("Max retries reached. Exiting.")
                 break
         except Exception as e:
             wait = min(60, 5 * attempt)
-            logger.exception("Unhandled exception starting polling: %s — sleeping %d seconds", e, wait)
+            logger.exception("Unhandled exception in polling: %s — sleeping %d", e, wait)
             time.sleep(wait)
             if attempt >= max_retries:
-                logger.error("Max retries reached for polling. Exiting.")
+                logger.error("Max retries reached. Exiting.")
                 break
 
-# -------------------------
-# Entry point
-# -------------------------
 if __name__ == "__main__":
     logger.info("=== BOT STARTING ===")
     print("=== BOT STARTING ===")
-    # re-parse required channels for runtime (in case parse function defined above)
     REQUIRED_CHANNELS_LIST = parse_channel_list(REQUIRED_CHANNELS)
     run_polling_with_retries(skip_updates=True, max_retries=20)
