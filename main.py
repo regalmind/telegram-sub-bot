@@ -1,28 +1,28 @@
-# main.py
-# Full corrected bot code with robustness fixes for Google Sheets API usage (ensure_sheet_exists bug fixed),
-# better range-recovery, admin rate-limits, pending confirm/reject, invite handling, subscription scheduling, etc.
-# All previously-requested features retained and tightened according to logs.
+# main.py — بخش ۱ از ۲
+# Telegram subscription bot — full implementation (split into two parts)
+# بخش اول شامل تنظیمات، راه‌اندازی Google Sheets (gspread)، توابع کمکی،
+# بوت و هندلرهای ابتدایی (start, email, platform info, support, test, buy)
+# بعد از اینکه این را پیست کردی و گفتی "اوکی"، بخش دوم را می‌فرستم.
 
 import os
 import json
-import base64
-import binascii
-import logging
-import asyncio
 import time
-import traceback
+import asyncio
+import logging
 import random
 import string
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, types, executor
 from aiogram.utils.exceptions import TerminatedByOtherGetUpdates, ChatNotFound
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
-from aiohttp import web
-import http.client
+import gspread
+import base64
+import binascii
+import uuid
+import traceback
 
 # -------------------------
 # Logging
@@ -34,42 +34,58 @@ logging.basicConfig(
 logger = logging.getLogger("telegram-sub-bot")
 
 # -------------------------
-# Environment variables
+# Config via ENV
 # -------------------------
-TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID") or os.getenv("SHEET_ID") or os.getenv("SPREADSHEET")
+# Required env vars (names used by this code):
+# TELEGRAM_TOKEN
+# ADMIN_TELEGRAM_ID
+# NORMAL_CHANNEL_ID (e.g. -1001234567890)
+# PREMIUM_CHANNEL_ID
+# TEST_CHANNEL_ID
+# SPREADSHEET_ID
+# GOOGLE_CREDENTIALS  (either raw JSON, substring, or base64 JSON) OR GOOGLE_SERVICE_ACCOUNT (file path)
+# PORT (optional, default 8000)
+# REQUIRED_CHANNELS (optional, comma-separated channel IDs to require membership)
+# INSTANCE_MODE (optional: "polling" or "webhook") - default polling
+
+TOKEN = os.getenv("TELEGRAM_TOKEN") or os.getenv("BOT_TOKEN")
+ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID") or os.getenv("PLATFORM_ADMIN")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_ENV = os.getenv("GOOGLE_CREDENTIALS")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT", "service-account.json")
-ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
-PORT = int(os.environ.get("PORT", "8000"))
-TEST_CHANNEL_ID = os.getenv("TEST_CHANNEL_ID")        # should be like -1001234567890 (string or int)
+PORT = int(os.getenv("PORT", "8000"))
 NORMAL_CHANNEL_ID = os.getenv("NORMAL_CHANNEL_ID")
 PREMIUM_CHANNEL_ID = os.getenv("PREMIUM_CHANNEL_ID")
-REFERRAL_PREFIX = os.getenv("REFERRAL_PREFIX", "REF-")
-ADMIN_NOTIFY_INTERVAL_SECONDS = int(os.getenv("ADMIN_NOTIFY_INTERVAL_SECONDS", "10"))
+TEST_CHANNEL_ID = os.getenv("TEST_CHANNEL_ID")
+REQUIRED_CHANNELS = os.getenv("REQUIRED_CHANNELS", "")  # comma separated
+INSTANCE_MODE = os.getenv("INSTANCE_MODE", "polling").lower()  # polling or webhook
 
-# Validation
+# basic validation
 if not TOKEN:
-    logger.error("Missing BOT_TOKEN / TELEGRAM_TOKEN env var.")
-    raise SystemExit("Missing BOT_TOKEN / TELEGRAM_TOKEN")
+    logger.error("Missing TELEGRAM_TOKEN env var. Set TELEGRAM_TOKEN.")
+    raise SystemExit("Missing TELEGRAM_TOKEN")
 if not SPREADSHEET_ID:
     logger.error("Missing SPREADSHEET_ID env var.")
     raise SystemExit("Missing SPREADSHEET_ID")
-if not ADMIN_TELEGRAM_ID:
-    logger.warning("ADMIN_TELEGRAM_ID not set. Admin notifications will be skipped or fail.")
+
+# Normalize required channels to list
+REQUIRED_CHANNELS_LIST = [c.strip() for c in REQUIRED_CHANNELS.split(",") if c.strip()]
 
 # -------------------------
-# Google credentials loader
+# Google Sheets setup (gspread)
 # -------------------------
-def load_google_creds() -> Dict[str, Any]:
+def load_google_creds_info() -> Dict[str, Any]:
+    # Try GOOGLE_CREDENTIALS env (raw json or base64) or file
     if GOOGLE_CREDENTIALS_ENV:
         s = GOOGLE_CREDENTIALS_ENV.strip()
+        # try raw json
         try:
             data = json.loads(s)
             logger.info("Loaded Google credentials from GOOGLE_CREDENTIALS (raw JSON).")
             return data
-        except json.JSONDecodeError:
+        except Exception:
             logger.debug("GOOGLE_CREDENTIALS raw parse failed; trying substring/base64.")
+        # try substring
         try:
             start = s.find("{")
             end = s.rfind("}")
@@ -80,6 +96,7 @@ def load_google_creds() -> Dict[str, Any]:
                 return data
         except Exception as e:
             logger.debug("substring recovery failed: %s", e)
+        # try base64
         try:
             decoded = base64.b64decode(s, validate=True)
             try:
@@ -90,6 +107,8 @@ def load_google_creds() -> Dict[str, Any]:
                 logger.warning("Base64 decoded but JSON parse failed: %s", e)
         except (binascii.Error, ValueError) as e:
             logger.debug("Not valid base64: %s", e)
+
+    # fallback: try file
     if os.path.exists(GOOGLE_SERVICE_ACCOUNT_FILE):
         try:
             with open(GOOGLE_SERVICE_ACCOUNT_FILE, "r", encoding="utf-8") as f:
@@ -98,223 +117,114 @@ def load_google_creds() -> Dict[str, Any]:
                 return data
         except Exception as e:
             logger.exception("Failed to load GOOGLE_SERVICE_ACCOUNT file: %s", e)
-    logger.error("No Google credentials found.")
+
+    logger.error("No Google credentials found. Set GOOGLE_CREDENTIALS or upload service-account.json.")
     raise SystemExit("Missing Google credentials")
 
-# -------------------------
-# Initialize Google Sheets client
-# -------------------------
-sheets_resource = None           # resource for spreadsheets()
-values_resource = None           # resource for values() calls (via sheets_resource.values())
+# create gspread client
+gc = None
 try:
-    creds_info = load_google_creds()
+    creds_info = load_google_creds_info()
     creds = service_account.Credentials.from_service_account_info(
-        creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        creds_info, scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     )
-    service = build("sheets", "v4", credentials=creds)
-    # according to google-api-python-client, service.spreadsheets() returns resource with get, batchUpdate, values() etc.
-    sheets_resource = service.spreadsheets()
-    values_resource = sheets_resource.values()
-    logger.info("Google Sheets client initialized.")
-except Exception:
-    logger.exception("Failed to initialize Google Sheets client; continuing with sheets_resource=None")
+    gc = gspread.authorize(creds)
+    logger.info("gspread client initialized.")
+except Exception as e:
+    logger.exception("Failed to initialize gspread: %s", e)
+    raise SystemExit("Failed to init Google Sheets client")
 
 # -------------------------
-# Sheet names & ranges
+# Sheet names and headers (matching your described sheets)
 # -------------------------
 USERS_SHEET = "Users"
-USERS_RANGE = f"{USERS_SHEET}!A1:K"
-SUBS_SHEET = "Subscriptions"
-SUBS_RANGE = f"{SUBS_SHEET}!A1:J"
-PENDING_SHEET = "PendingPayments"
-PENDING_RANGE = f"{PENDING_SHEET}!A1:K"
+PURCHASES_SHEET = "Purchases"
+REFERRALS_SHEET = "Referrals"
 SUPPORT_SHEET = "Support"
-SUPPORT_RANGE = f"{SUPPORT_SHEET}!A1:E"
+SUBS_SHEET = "Subscription"
+CONFIG_SHEET = "Config"  # for editable platform info and keys
 
-DEFAULT_HEADERS = {
-    USERS_SHEET: ["user_id","full_name","email","referral_code","referred_by","status","purchase_status","expires_at","created_at","last_seen","notes"],
-    SUBS_SHEET: ["user_id","plan","status","expires_at","created_at","notes"],
-    PENDING_SHEET: ["user_id","full_name","transaction_info","status","created_at","plan","admin_notes","notified_at","row_index","extra","meta"],
-    SUPPORT_SHEET: ["user_id","full_name","message","created_at","status"],
+HEADERS = {
+    USERS_SHEET: ["telegram_id", "full_name", "email", "referral_code", "referred_by", "status", "purchase_status", "expires_at", "created_at", "last_seen", "notes"],
+    PURCHASES_SHEET: ["telegram_id", "full_name", "email", "product", "amount", "transaction_info", "status", "request_at", "activated_at", "expires_at", "admin_note"],
+    REFERRALS_SHEET: ["telegram_id", "referral_code", "referred_count", "created_at"],
+    SUPPORT_SHEET: ["ticket_id", "telegram_id", "full_name", "subject", "message", "status", "created_at", "response", "responded_at"],
+    SUBS_SHEET: ["telegram_id", "product", "activated_at", "expires_at", "active"],
+    CONFIG_SHEET: ["key", "value"],
 }
 
-# -------------------------
-# Bot & Dispatcher
-# -------------------------
-bot = Bot(token=TOKEN)
-dp = Dispatcher(bot)
-
-# -------------------------
-# Blocking Google calls wrappers
-# -------------------------
-def _sheets_values_get(spreadsheet_id: str, range_name: str) -> Dict[str, Any]:
-    if values_resource is None:
-        raise RuntimeError("Sheets client not initialized")
-    return values_resource.get(spreadsheetId=spreadsheet_id, range=range_name).execute()
-
-def _sheets_values_append(spreadsheet_id: str, range_name: str, values: List[List[Any]]):
-    if values_resource is None:
-        raise RuntimeError("Sheets client not initialized")
-    return values_resource.append(
-        spreadsheetId=spreadsheet_id,
-        range=range_name,
-        valueInputOption="USER_ENTERED",
-        body={"values": values}
-    ).execute()
-
-def _sheets_values_update(spreadsheet_id: str, range_name: str, values: List[List[Any]]):
-    if values_resource is None:
-        raise RuntimeError("Sheets client not initialized")
-    return values_resource.update(
-        spreadsheetId=spreadsheet_id,
-        range=range_name,
-        valueInputOption="USER_ENTERED",
-        body={"values": values}
-    ).execute()
-
-# run blocking function in executor with retries for transient http.client.IncompleteRead issues
-async def run_in_executor(func, *args, retries=3, delay=1.0):
-    loop = asyncio.get_running_loop()
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            return await loop.run_in_executor(None, func, *args)
-        except http.client.IncompleteRead as e:
-            logger.warning("Executor IncompleteRead attempt %d: %s", attempt, e)
-            if attempt >= retries:
-                raise
-            await asyncio.sleep(delay * attempt)
-        except Exception as e:
-            logger.exception("Executor call attempt %d failed: %s", attempt, e)
-            if attempt >= retries:
-                raise
-            await asyncio.sleep(delay * attempt)
-
-# -------------------------
-# Ensure sheet exists (FIXED: use sheets_resource.get)
-# -------------------------
-async def ensure_sheet_exists(sheet_name: str) -> bool:
-    """
-    Ensure sheet exists in spreadsheet. If not, create it and write header if known.
-    Fixed to call sheets_resource.get(...) correctly.
-    """
-    if sheets_resource is None:
-        logger.error("sheets_resource not initialized; cannot ensure sheet.")
-        return False
+# helper: open spreadsheet and ensure worksheet exists + header
+def open_sheet(ws_name: str):
     try:
-        # get spreadsheet metadata using spreadsheets().get
-        meta = await run_in_executor(lambda sid: sheets_resource.get(spreadsheetId=sid).execute(), SPREADSHEET_ID)
-        sheet_titles = [s.get("properties", {}).get("title") for s in meta.get("sheets", [])]
-        if sheet_name in sheet_titles:
-            return True
-        # create sheet via batchUpdate
-        body = {"requests": [{"addSheet": {"properties": {"title": sheet_name}}}]}
-        await run_in_executor(lambda sid, b: sheets_resource.batchUpdate(spreadsheetId=sid, body=b).execute(), SPREADSHEET_ID, body)
-        # write header if available
-        header = DEFAULT_HEADERS.get(sheet_name)
-        if header:
-            try:
-                await run_in_executor(_sheets_values_append, SPREADSHEET_ID, f"{sheet_name}!A1:1", [header])
-            except Exception:
-                try:
-                    await run_in_executor(_sheets_values_append, SPREADSHEET_ID, f"{sheet_name}!A1:K", [header])
-                except Exception:
-                    logger.exception("Failed to write header to new sheet %s", sheet_name)
-        logger.info("Created sheet %s and wrote header.", sheet_name)
+        sh = gc.open_by_key(SPREADSHEET_ID)
+    except Exception as e:
+        logger.exception("Failed to open spreadsheet: %s", e)
+        raise
+    try:
+        try:
+            w = sh.worksheet(ws_name)
+        except gspread.WorksheetNotFound:
+            logger.info("Worksheet %s not found. Creating.", ws_name)
+            w = sh.add_worksheet(title=ws_name, rows="1000", cols="20")
+        # ensure header
+        values = w.get_all_values()
+        if not values or (len(values) == 0) or (values[0] == []):
+            header = HEADERS.get(ws_name, [])
+            if header:
+                w.insert_row(header, index=1)
+                logger.info("Wrote header for %s", ws_name)
+        else:
+            # if header exists but not matching expected, keep existing to avoid data loss
+            pass
+        return w
+    except Exception as e:
+        logger.exception("Failed to open/create worksheet %s: %s", ws_name, e)
+        raise
+
+# convenience wrappers
+async def sheets_append(ws_name: str, row: List[Any]) -> bool:
+    # small sanitize
+    row = [str(x)[:2000] if x is not None else "" for x in row]
+    try:
+        w = open_sheet(ws_name)
+        w.append_row(row, value_input_option="USER_ENTERED")
         return True
-    except Exception as e:
-        logger.exception("Failed to ensure sheet exists (%s): %s", sheet_name, e)
+    except Exception:
+        logger.exception("sheets_append failed for sheet %s", ws_name)
         return False
 
-# -------------------------
-# Robust sheets get/append/update wrappers
-# -------------------------
-async def sheets_get(range_name: str) -> Optional[List[List[Any]]]:
+async def sheets_get_all(ws_name: str) -> List[List[str]]:
     try:
-        res = await run_in_executor(_sheets_values_get, SPREADSHEET_ID, range_name)
-        return res.get("values", [])
-    except HttpError as he:
-        content = ""
-        try:
-            content = he.content.decode() if isinstance(he.content, (bytes, bytearray)) else str(he.content)
-        except Exception:
-            content = str(he)
-        if "Unable to parse range" in content or "Invalid range" in content:
-            if "!" in range_name:
-                sheet = range_name.split("!")[0].strip().strip("'")
-                created = await ensure_sheet_exists(sheet)
-                if created:
-                    retry_range = f"{sheet}!A1:K"
-                    try:
-                        res = await run_in_executor(_sheets_values_get, SPREADSHEET_ID, retry_range)
-                        return res.get("values", [])
-                    except Exception as e2:
-                        logger.exception("Retry after create sheet failed: %s", e2)
-                        return None
-            logger.error("Range parse error and could not recover: %s", range_name)
-        logger.exception("sheets_get failed for %s: %s", range_name, he)
-        return None
-    except Exception as e:
-        logger.exception("sheets_get failed for %s: %s", range_name, e)
-        return None
+        w = open_sheet(ws_name)
+        vals = w.get_all_values()
+        return vals
+    except Exception:
+        logger.exception("sheets_get_all failed for %s", ws_name)
+        return []
 
-async def sheets_append(range_name: str, values: List[List[Any]]) -> bool:
+async def sheets_update_range(ws_name: str, start_row: int, start_col: int, values: List[List[Any]]) -> bool:
+    # gspread uses A1 notation; convert
     try:
-        await run_in_executor(_sheets_values_append, SPREADSHEET_ID, range_name, values)
+        w = open_sheet(ws_name)
+        cell_range = gspread.utils.rowcol_to_a1(start_row, start_col) + ":" + gspread.utils.rowcol_to_a1(start_row + len(values) - 1, start_col + (len(values[0]) - 1))
+        w.update(cell_range, values)
         return True
-    except HttpError as he:
-        content = ""
-        try:
-            content = he.content.decode() if isinstance(he.content, (bytes, bytearray)) else str(he.content)
-        except Exception:
-            content = str(he)
-        if "Unable to parse range" in content or "Invalid range" in content:
-            if "!" in range_name:
-                sheet = range_name.split("!")[0].strip().strip("'")
-                created = await ensure_sheet_exists(sheet)
-                if created:
-                    try:
-                        await run_in_executor(_sheets_values_append, SPREADSHEET_ID, f"{sheet}!A1:K", values)
-                        return True
-                    except Exception as e2:
-                        logger.exception("Append retry failed after creating sheet: %s", e2)
-                        return False
-        logger.exception("sheets_append failed for %s: %s", range_name, he)
-        return False
-    except Exception as e:
-        logger.exception("sheets_append failed for %s: %s", range_name, e)
+    except Exception:
+        logger.exception("sheets_update_range failed for %s", ws_name)
         return False
 
-async def sheets_update(range_name: str, values: List[List[Any]]) -> bool:
+async def sheets_update_row(ws_name: str, row_idx: int, values: List[Any]) -> bool:
     try:
-        await run_in_executor(_sheets_values_update, SPREADSHEET_ID, range_name, values)
+        w = open_sheet(ws_name)
+        cell_range = f"A{row_idx}:{gspread.utils.rowcol_to_a1(row_idx, len(values))}"
+        w.update(cell_range, [values])
         return True
-    except HttpError as he:
-        content = ""
-        try:
-            content = he.content.decode() if isinstance(he.content, (bytes, bytearray)) else str(he.content)
-        except Exception:
-            content = str(he)
-        if "Unable to parse range" in content or "Invalid range" in content:
-            if "!" in range_name:
-                sheet = range_name.split("!")[0].strip().strip("'")
-                created = await ensure_sheet_exists(sheet)
-                if created:
-                    try:
-                        await run_in_executor(_sheets_values_update, SPREADSHEET_ID, range_name, values)
-                        return True
-                    except Exception as e2:
-                        logger.exception("Update retry failed after creating sheet: %s", e2)
-                        return False
-        logger.exception("sheets_update failed for %s: %s", range_name, he)
-        return False
-    except Exception as e:
-        logger.exception("sheets_update failed for %s: %s", range_name, e)
+    except Exception:
+        logger.exception("sheets_update_row failed for %s row %s", ws_name, row_idx)
         return False
 
 # -------------------------
-# Helpers
+# Helpers (time, referral, parse)
 # -------------------------
 def now_iso() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat()
@@ -329,64 +239,55 @@ def parse_iso_or_none(s: str) -> Optional[datetime]:
 
 def generate_referral_code(length: int = 6) -> str:
     chars = string.ascii_uppercase + string.digits
-    return REFERRAL_PREFIX + ''.join(random.choice(chars) for _ in range(length))
+    return ''.join(random.choice(chars) for _ in range(length))
 
-async def find_user_row_by_id(user_id: int) -> Optional[Tuple[int, List[str]]]:
-    rows = await sheets_get(USERS_RANGE)
-    if not rows:
-        return None
-    for idx, row in enumerate(rows[1:], start=2):
+def ensure_user_row_and_return(user: types.User, email: Optional[str] = None) -> Tuple[int, List[str]]:
+    """
+    Ensure user exists in Users sheet. Returns (row_index (1-based), row_values)
+    This is synchronous wrapper around gspread operations (safe to call from async tasks).
+    """
+    w = open_sheet(USERS_SHEET)
+    values = w.get_all_values()
+    header = values[0] if values else HEADERS[USERS_SHEET]
+    # search for user
+    for idx, row in enumerate(values[1:], start=2):
         try:
-            if str(row[0]) == str(user_id):
+            if len(row) > 0 and str(row[0]) == str(user.id):
+                # update name/email/last_seen if needed
+                changed = False
+                # ensure enough columns
+                while len(row) < len(header):
+                    row.append("")
+                if email and (not row[2]):
+                    row[2] = email
+                    changed = True
+                if not row[1]:
+                    row[1] = user.full_name or ""
+                    changed = True
+                if row[9] != now_iso():
+                    row[9] = now_iso()
+                    changed = True
+                if changed:
+                    w.update(f"A{idx}:K{idx}", [row])
                 return idx, row
         except Exception:
             continue
-    return None
-
-async def ensure_user_in_sheet(user: types.User, email: Optional[str]=None) -> bool:
-    rows = await sheets_get(USERS_RANGE)
-    header = []
-    if rows and len(rows) > 0:
-        header = rows[0]
-    else:
-        header = DEFAULT_HEADERS.get(USERS_SHEET)
-        if not header:
-            header = ["user_id","full_name","email","referral_code","referred_by","status","purchase_status","expires_at","created_at","last_seen","notes"]
-        ok = await sheets_append(f"{USERS_SHEET}!A1:K", [header])
-        if not ok:
-            logger.error("Failed to write Users header")
-    rows = await sheets_get(USERS_RANGE)
-    if rows and len(rows) > 1:
-        for idx, row in enumerate(rows[1:], start=2):
-            try:
-                if len(row) > 0 and str(row[0]) == str(user.id):
-                    updated = False
-                    if email and (len(row) < 3 or not row[2]):
-                        row[2:3] = [email]
-                        updated = True
-                    if len(row) < 2 or not row[1]:
-                        name = f"{user.full_name or ''}".strip()
-                        row[1:2] = [name]
-                        updated = True
-                    if len(row) < 10 or row[9] != now_iso():
-                        row[9:10] = [now_iso()]
-                        updated = True
-                    if updated:
-                        rng = f"{USERS_SHEET}!A{idx}:K{idx}"
-                        await sheets_update(rng, [row])
-                    return True
-            except Exception:
-                continue
-    # append new user
-    name = f"{user.full_name or ''}".strip()
-    referral_code = generate_referral_code()
+    # append new
+    referral = generate_referral_code()
     created_at = now_iso()
-    new_row = [str(user.id), name, email or "", referral_code, "", "active", "none", "", created_at, now_iso(), ""]
-    ok = await sheets_append(f"{USERS_SHEET}!A1:K", [new_row])
-    return ok
+    new_row = [str(user.id), user.full_name or "", email or "", referral, "", "active", "none", "", created_at, now_iso(), ""]
+    w.append_row(new_row, value_input_option="USER_ENTERED")
+    vals2 = w.get_all_values()
+    return len(vals2), vals2[-1]
 
 # -------------------------
-# Invite and temporary trial management
+# Bot & dispatcher
+# -------------------------
+bot = Bot(token=TOKEN)
+dp = Dispatcher(bot)
+
+# -------------------------
+# Invite and trial management
 # -------------------------
 scheduled_removals: Dict[int, asyncio.Task] = {}
 
@@ -395,7 +296,7 @@ async def create_temporary_invite(chat_id: str, expire_seconds: int = 600, membe
         expire_date = int((datetime.utcnow() + timedelta(seconds=expire_seconds)).timestamp())
         link = await bot.create_chat_invite_link(chat_id=chat_id, expire_date=expire_date, member_limit=member_limit)
         invite_url = link.invite_link
-        logger.info("Created invite link for chat %s, expires in %d seconds", chat_id, expire_seconds)
+        logger.info("Created invite link for chat %s", chat_id)
         return invite_url
     except Exception as e:
         logger.exception("Failed to create invite link for %s: %s", chat_id, e)
@@ -403,11 +304,10 @@ async def create_temporary_invite(chat_id: str, expire_seconds: int = 600, membe
 
 async def remove_user_from_chat(chat_id: str, user_id: int) -> bool:
     try:
-        # ban->unban method to force removal (works for channels/groups)
         await bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
         await asyncio.sleep(0.8)
         await bot.unban_chat_member(chat_id=chat_id, user_id=user_id, only_if_banned=True)
-        logger.info("Removed user %s from chat %s (ban->unban).", user_id, chat_id)
+        logger.info("Removed user %s from chat %s", user_id, chat_id)
         return True
     except Exception as e:
         logger.exception("Failed to remove user %s from chat %s: %s", user_id, chat_id, e)
@@ -434,7 +334,7 @@ async def schedule_remove_after(chat_id: str, user_id: int, delay_seconds: int =
     scheduled_removals[user_id] = task
 
 # -------------------------
-# Keyboards
+# Keyboards & UI
 # -------------------------
 def build_main_keyboard():
     keyboard = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -446,48 +346,92 @@ def build_main_keyboard():
         keyboard.row(*[types.KeyboardButton(b) for b in row])
     return keyboard
 
-def admin_confirm_keyboard(user_id: int, pending_row_index: int):
+def admin_confirm_keyboard(purchase_row_index: int, user_id: int):
     kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("تأیید خرید ✅", callback_data=f"confirm:{pending_row_index}:{user_id}"))
-    kb.add(types.InlineKeyboardButton("رد خرید ❌", callback_data=f"reject:{pending_row_index}:{user_id}"))
+    kb.add(types.InlineKeyboardButton("تأیید خرید ✅", callback_data=f"confirm:{purchase_row_index}:{user_id}"))
+    kb.add(types.InlineKeyboardButton("رد خرید ❌", callback_data=f"reject:{purchase_row_index}:{user_id}"))
     return kb
 
 # -------------------------
-# Handlers
+# Membership check (required channels)
+# -------------------------
+async def is_member_of(chat_id: str, user_id: int) -> bool:
+    try:
+        mem = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        status = mem.status  # 'creator', 'administrator', 'member', 'restricted', 'left', 'kicked'
+        return status not in ("left", "kicked")
+    except Exception as e:
+        logger.exception("is_member_of error for chat %s user %s: %s", chat_id, user_id, e)
+        return False
+
+async def enforce_required_channels(user_id: int) -> Tuple[bool, List[str]]:
+    not_member = []
+    for ch in REQUIRED_CHANNELS_LIST:
+        try:
+            ok = await is_member_of(ch, user_id)
+            if not ok:
+                not_member.append(ch)
+        except Exception:
+            not_member.append(ch)
+    return (len(not_member) == 0, not_member)
+
+# -------------------------
+# Handlers: start, email, menu
 # -------------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    logger.info("Received /start from %s", message.from_user.id)
-    found = False
-    rows = await sheets_get(USERS_RANGE)
-    if rows and len(rows) > 1:
-        for row in rows[1:]:
-            try:
-                if str(row[0]) == str(message.from_user.id):
-                    found = True
-                    break
-            except Exception:
-                continue
-    if found:
+    try:
+        ok_membership, missing = await enforce_required_channels(message.from_user.id)
+        if not ok_membership:
+            await message.answer("⚠️ برای استفاده از ربات باید در کانال‌های مربوطه عضو باشید. لطفا ابتدا در کانال‌های زیر عضو شوید:\n" + "\n".join(missing))
+            return
+        ensure_user_row_and_return(message.from_user)
         kb = build_main_keyboard()
-        await message.answer("👋 خوش آمدید مجدد! منوی اصلی در ادامه برای شما فرستاده شد:", reply_markup=kb)
-    else:
-        await message.answer("👋 خوش آمدید!\nبرای ادامه لطفاً ایمیل خود را وارد کنید:", reply_markup=types.ReplyKeyboardRemove())
-        await message.answer("✉️ منتظر ایمیل شما هستم...")
+        await message.answer("👋 خوش آمدید! منوی اصلی:", reply_markup=kb)
+    except Exception as e:
+        logger.exception("Error in /start: %s", e)
+        await message.answer("خطا در شروع. لطفا بعداً تلاش کنید.")
 
 @dp.message_handler(lambda msg: msg.text is not None and "@" in msg.text and "." in msg.text)
 async def handle_email(message: types.Message):
     email = message.text.strip()
-    ok = await ensure_user_in_sheet(message.from_user, email=email)
-    if ok:
+    try:
+        # basic format check
+        if len(email) < 5 or " " in email:
+            await message.answer("ایمیل وارد شده معتبر نیست.")
+            return
+        row_idx, _ = ensure_user_row_and_return(message.from_user, email=email)
         kb = build_main_keyboard()
         await message.answer("✅ ایمیل ثبت شد! لطفاً از منوی زیر انتخاب کنید:", reply_markup=kb)
-    else:
+    except Exception as e:
+        logger.exception("handle_email error: %s", e)
         await message.answer("❌ ثبت ایمیل با خطا مواجه شد. لطفاً بعداً تلاش کنید.")
+
+@dp.message_handler(lambda msg: msg.text == "توضیحات پلتفرم")
+async def platform_info(message: types.Message):
+    try:
+        w = open_sheet(CONFIG_SHEET)
+        vals = w.get_all_values()
+        content = ""
+        for row in vals[1:]:
+            if len(row) >= 2 and row[0] == "platform_info":
+                content = row[1]
+                break
+        if not content:
+            content = "📘 توضیحات پلتفرم هنوز تنظیم نشده است."
+        await message.answer(content)
+    except Exception as e:
+        logger.exception("platform_info error: %s", e)
+        await message.answer("خطا در دریافت توضیحات پلتفرم.")
+
+@dp.message_handler(lambda msg: msg.text == "پشتیبانی")
+async def support(message: types.Message):
+    ensure_user_row_and_return(message.from_user)
+    await message.answer("🧰 لطفاً سوال یا مشکل خود را به صورت یک پیام بفرستید تا تیکت ثبت شود.")
 
 @dp.message_handler(lambda msg: msg.text == "تست کانال معمولی")
 async def test_channel(message: types.Message):
-    await ensure_user_in_sheet(message.from_user)
+    ensure_user_row_and_return(message.from_user)
     if not TEST_CHANNEL_ID:
         await message.answer("⚠️ کانال تست تنظیم نشده است. با ادمین تماس بگیرید.")
         return
@@ -497,52 +441,67 @@ async def test_channel(message: types.Message):
         return
     await message.answer("⏳ لینک عضویت موقت برای شما ایجاد شد (۱۰ دقیقه):\n" + invite, disable_web_page_preview=True)
     await schedule_remove_after(TEST_CHANNEL_ID, message.from_user.id, delay_seconds=600)
+    await sheets_append(PURCHASES_SHEET, [str(message.from_user.id), message.from_user.full_name or "", "", "trial", "0", "test_invite", "trial", now_iso(), "", "", ""])
 
 @dp.message_handler(lambda msg: msg.text == "خرید کانال معمولی")
 async def buy_normal(message: types.Message):
-    await ensure_user_in_sheet(message.from_user)
-    await message.answer("💳 لطفاً مبلغ مربوط به اشتراک را به شماره کارت زیر واریز کنید:\n\n`6037-9917-1234-5678`\n\nپس از پرداخت، اطلاعات تراکنش (شناسه تراکنش) را ارسال کنید.\nتوجه: پس از تایید پرداخت، کد رفرال شما ارسال خواهد شد.")
+    ensure_user_row_and_return(message.from_user)
+    await message.answer("💳 لطفاً مبلغ مربوط به اشتراک را به شماره کارت زیر واریز کنید:\n\n`6037-9917-1234-5678`\n\nپس از پرداخت، اطلاعات تراکنش (شناسه تراکنش یا متن اطلاعات) را ارسال کنید.\nتوجه: پس از تایید پرداخت، اشتراک شما فعال خواهد شد.")
 
 @dp.message_handler(lambda msg: msg.text == "خرید کانال ویژه")
 async def buy_premium(message: types.Message):
-    await ensure_user_in_sheet(message.from_user)
-    await message.answer("🌟 برای خرید اشتراک ویژه، لطفاً مبلغ را به شماره کارت زیر واریز کنید:\n\n`6037-9917-1234-5678`\n\nپس از پرداخت، اطلاعات تراکنش را ارسال نمایید.\nتوجه: پس از تایید پرداخت، کد رفرال شما ارسال خواهد شد. با خرید ویژه هر دو کانال اضافه خواهد شد.")
+    ensure_user_row_and_return(message.from_user)
+    await message.answer("🌟 برای خرید اشتراک ویژه، لطفاً مبلغ را به شماره کارت زیر واریز کنید:\n\n`6037-9917-1234-5678`\n\nپس از پرداخت، اطلاعات تراکنش را ارسال نمایید.\nتوجه: پس از تایید پرداخت، اشتراک ویژه برای شما فعال خواهد شد.")
 
-@dp.message_handler(lambda msg: msg.text == "پشتیبانی")
-async def support(message: types.Message):
-    await ensure_user_in_sheet(message.from_user)
-    await message.answer("🧰 لطفاً سوال یا مشکل خود را ارسال کنید تا برای شما تیکت ایجاد شود.")
-
-@dp.message_handler(lambda msg: msg.text == "توضیحات پلتفرم")
-async def platform_info(message: types.Message):
-    await message.answer("📘 توضیحات پلتفرم به‌زودی در این بخش قرار خواهد گرفت.")
-
-# Catch user messages: either transaction info (simple heuristic) or support ticket
+# catch-all text handler: either transaction info or support ticket
 @dp.message_handler(content_types=types.ContentTypes.TEXT)
 async def catch_all_text(message: types.Message):
-    text = message.text.strip()
-    # heuristic: if text contains numbers and length >= 6, treat as transaction info
+    text = (message.text or "").strip()
+    if not text:
+        return
+    # heuristic: transaction if contains digits and length >= 6
     if len(text) >= 6 and any(ch.isdigit() for ch in text):
         created_at = now_iso()
-        row = [str(message.from_user.id), message.from_user.full_name or "", text, "pending", created_at, "", "", "", "", ""]
-        ok = await sheets_append(f"{PENDING_SHEET}!A1:K", [row])
+        # append to Purchases sheet with status pending
+        row = [str(message.from_user.id), message.from_user.full_name or "", "", "unknown", "", text, "pending", created_at, "", "", ""]
+        ok = await sheets_append(PURCHASES_SHEET, row)
         if ok:
             await message.answer("✅ تراکنش شما ثبت شد و در انتظار بررسی ادمین است. به زودی اطلاع‌رسانی می‌شود.")
-            await notify_admin_pending(row)
+            # admin will be notified by poller (بخش دوم کد)
         else:
             await message.answer("❌ ثبت تراکنش انجام نشد. لطفاً دوباره تلاش کنید.")
     else:
+        # support ticket
+        ticket_id = str(uuid.uuid4())[:8]
         created_at = now_iso()
-        ticket_row = [str(message.from_user.id), message.from_user.full_name or "", text, created_at, "open"]
-        await sheets_append(f"{SUPPORT_SHEET}!A1:E", [ticket_row])
-        await message.answer("✅ تیکت شما ثبت شد. پاسخ از طریق این ربات ارسال خواهد شد.")
+        ticket_row = [ticket_id, str(message.from_user.id), message.from_user.full_name or "", "کاربر-پیام", text, "open", created_at, "", ""]
+        ok = await sheets_append(SUPPORT_SHEET, ticket_row)
+        if ok:
+            await message.answer("✅ تیکت شما ثبت شد. پاسخ از طریق همین ربات ارسال خواهد شد.")
+            if ADMIN_TELEGRAM_ID:
+                try:
+                    await bot.send_message(int(ADMIN_TELEGRAM_ID), f"🎫 تیکت جدید: {ticket_id}\nUser: {message.from_user.id}\nMessage: {text}")
+                except Exception:
+                    logger.exception("Could not notify admin of support ticket.")
+        else:
+            await message.answer("❌ ثبت تیکت انجام نشد. لطفاً دوباره تلاش کنید.")
 
-# -------------------------
-# Admin notifications with rate-limiting
-# -------------------------
+# === پایان بخش ۱ از ۲ ===
+# پس از اینکه این قطعه را در فایل main.py پیست کردی، به من بگو "اوکی"
+# تا ادامه (بخش ۲) را فوراً بفرستم تا کنار این پیست کنی.
+# main.py — بخش 2 از 2 (ادامه)
+# ادامهٔ توابع پشت‌صحنه: نوتیفای ادمین، poller، callback handler، بازسازی اشتراک‌ها،
+# دستورات ادمین، وب‌سرور و entrypoint.
+
+# Admin notify rate-limiting
+ADMIN_NOTIFY_INTERVAL_SECONDS = int(os.getenv("ADMIN_NOTIFY_INTERVAL_SECONDS", "10"))
 _last_admin_notify_time: Dict[str, float] = {}
 
 async def notify_admin_pending(pending_row: List[str]):
+    """
+    Notify admin about a newly created pending purchase (best-effort, rate-limited).
+    The poller does the full actionable notify (with inline buttons) — این تابع فقط اطلاع‌رسانی اولیه است.
+    """
     if not ADMIN_TELEGRAM_ID:
         logger.warning("No ADMIN_TELEGRAM_ID configured; skipping admin notify.")
         return
@@ -552,99 +511,128 @@ async def notify_admin_pending(pending_row: List[str]):
         logger.info("Admin notify rate-limited; skipping.")
         return
     _last_admin_notify_time[str(ADMIN_TELEGRAM_ID)] = now_t
-    user_id = pending_row[0]
-    trans_info = pending_row[2] if len(pending_row) > 2 else ""
-    created_at = pending_row[4] if len(pending_row) > 4 else ""
+    user_id = pending_row[0] if len(pending_row) > 0 else ""
+    trans_info = pending_row[5] if len(pending_row) > 5 else ""
+    created_at = pending_row[7] if len(pending_row) > 7 else ""
     msg = f"🔔 تراکنش جدید ثبت شد\nUser: {user_id}\nInfo: {trans_info}\nTime: {created_at}"
     try:
         await bot.send_message(int(ADMIN_TELEGRAM_ID), msg)
-    except ChatNotFound:
-        logger.exception("Admin chat not found when notifying pending.")
-    except Exception as e:
-        logger.exception("Failed to notify admin: %s", e)
+    except Exception:
+        logger.exception("Failed to send admin notify.")
 
-# -------------------------
-# Poller: notify admin about pending payments and attach inline confirm/reject
-# -------------------------
+# Poller: scan Purchases sheet, notify admin about pending rows with inline confirm/reject
 async def poll_pending_notify_admin():
     await asyncio.sleep(2)
     while True:
         try:
-            rows = await sheets_get(PENDING_RANGE)
+            rows = await sheets_get_all(PURCHASES_SHEET)
             if rows and len(rows) > 1:
                 for idx, row in enumerate(rows[1:], start=2):
-                    status = row[3] if len(row) > 3 else "pending"
-                    notified = row[7] if len(row) > 7 else ""
-                    if status.lower() == "pending" and not notified:
-                        if not ADMIN_TELEGRAM_ID:
-                            break
-                        msg = f"🔔 Pending payment #{idx-1}\nUser: {row[0]}\nName: {row[1]}\nInfo: {row[2]}\nTime: {row[4]}"
-                        try:
-                            await bot.send_message(int(ADMIN_TELEGRAM_ID), msg, reply_markup=admin_confirm_keyboard(int(row[0]), idx))
-                        except Exception as e:
-                            logger.exception("Failed to notify admin about pending row %s: %s", idx, e)
-                        # mark notified timestamp in column H
-                        range_row = f"{PENDING_SHEET}!H{idx}:H{idx}"
-                        await sheets_update(range_row, [[now_iso()]])
-            await asyncio.sleep(15)
+                    try:
+                        status = (row[6] if len(row) > 6 else "").lower()
+                        admin_note = (row[10] if len(row) > 10 else "")
+                        if status == "pending" and not admin_note:
+                            if not ADMIN_TELEGRAM_ID:
+                                break
+                            user_id = int(row[0]) if row and row[0].isdigit() else 0
+                            msg = f"🔔 Pending purchase (row {idx})\nUser: {row[0]}\nName: {row[1]}\nInfo: {row[5]}\nTime: {row[7]}"
+                            try:
+                                await bot.send_message(int(ADMIN_TELEGRAM_ID), msg, reply_markup=admin_confirm_keyboard(idx, user_id))
+                                # mark notified time in admin_note column (index 10 / col K)
+                                # ensure row length
+                                while len(row) < 11:
+                                    row.append("")
+                                row[10] = now_iso()
+                                await sheets_update_row(PURCHASES_SHEET, idx, row)
+                            except Exception:
+                                logger.exception("Failed to notify admin about pending row %s", idx)
+            await asyncio.sleep(12)
         except Exception as e:
             logger.exception("poll_pending_notify_admin loop error: %s", e)
             await asyncio.sleep(20)
 
-# -------------------------
-# Callback handler for admin confirm/reject
-# -------------------------
+# Callback handler for confirm/reject
 @dp.callback_query_handler(lambda c: c.data and (c.data.startswith("confirm:") or c.data.startswith("reject:")))
 async def process_admin_confirmation(callback_query: types.CallbackQuery):
     data = callback_query.data
     parts = data.split(":")
     action = parts[0]
-    pending_row_idx = int(parts[1])
-    target_user_id = int(parts[2])
     try:
-        rows = await sheets_get(PENDING_RANGE)
-        if not rows or pending_row_idx - 1 >= len(rows):
+        purchase_row_idx = int(parts[1])
+        target_user_id = int(parts[2])
+    except Exception:
+        await callback_query.answer("فرمت داده نامعتبر.", show_alert=True)
+        return
+    try:
+        rows = await sheets_get_all(PURCHASES_SHEET)
+        if not rows or purchase_row_idx - 1 >= len(rows):
             await callback_query.answer("ردیف موجود نیست یا قبلا تغییر کرده.", show_alert=True)
             return
-        row = rows[pending_row_idx - 1]
+        row = rows[purchase_row_idx - 1]
+        # ensure row has enough columns
+        while len(row) < 11:
+            row.append("")
         if action == "confirm":
-            await sheets_update(f"{PENDING_SHEET}!D{pending_row_idx}:D{pending_row_idx}", [["confirmed"]])
-            plan = "normal"
-            if len(row) > 5 and row[5]:
-                plan = row[5]
+            # set status = confirmed
+            row[6] = "confirmed"
+            activated = now_iso()
             expires = (datetime.utcnow() + timedelta(days=30*6)).replace(microsecond=0).isoformat()
-            sub_row = [str(target_user_id), plan, "confirmed", expires, now_iso(), row[2] if len(row) > 2 else ""]
-            await sheets_append(f"{SUBS_SHEET}!A1:F", [sub_row])
-            user_lookup = await find_user_row_by_id(target_user_id)
-            urow = None
-            if user_lookup:
-                idx, urow = user_lookup
-                while len(urow) < 8:
-                    urow.append("")
-                urow[6] = "active"
-                urow[7] = expires
-                range_u = f"{USERS_SHEET}!A{idx}:K{idx}"
-                await sheets_update(range_u, [urow])
-            # send confirmation + referral code; attach channels
+            row[8] = activated
+            row[9] = expires
+            await sheets_update_row(PURCHASES_SHEET, purchase_row_idx, row)
+            # append subscription
+            plan = "premium" if ("premium" in (row[3] or "").lower()) else "normal"
+            sub_row = [str(target_user_id), plan, activated, expires, "yes"]
+            await sheets_append(SUBS_SHEET, sub_row)
+            # update Users sheet for this user
             try:
-                referral = (urow[3] if urow and len(urow) > 3 and urow[3] else generate_referral_code())
-                await bot.send_message(target_user_id, "🎉 پرداخت شما تایید شد. تبریک! اشتراک شما فعال شد.\nکد معرفی شما: " + referral)
+                u_w = open_sheet(USERS_SHEET)
+                u_vals = u_w.get_all_values()
+                found_idx = None
+                for i, ur in enumerate(u_vals[1:], start=2):
+                    if len(ur) > 0 and str(ur[0]) == str(target_user_id):
+                        found_idx = i
+                        u_row = ur
+                        break
+                if found_idx:
+                    while len(u_row) < 11:
+                        u_row.append("")
+                    u_row[6] = "active"
+                    u_row[7] = expires
+                    if not u_row[3]:
+                        u_row[3] = generate_referral_code()
+                    u_w.update(f"A{found_idx}:K{found_idx}", [u_row])
+            except Exception:
+                logger.exception("Failed to update Users after confirm.")
+            # DM user with referral + invite links
+            try:
+                referral = ""
+                try:
+                    uvals = open_sheet(USERS_SHEET).get_all_values()
+                    for ur in uvals[1:]:
+                        if ur and len(ur) > 0 and str(ur[0]) == str(target_user_id):
+                            referral = ur[3] if len(ur) > 3 else ""
+                except Exception:
+                    pass
+                await bot.send_message(target_user_id, "🎉 پرداخت شما تایید شد. اشتراک شما فعال شد.\nکد معرفی شما: " + (referral or generate_referral_code()))
                 if plan == "premium":
                     for ch in [NORMAL_CHANNEL_ID, PREMIUM_CHANNEL_ID]:
                         if ch:
-                            link = await create_temporary_invite(ch, expire_seconds=60 * 60 * 24, member_limit=1)
+                            link = await create_temporary_invite(ch, expire_seconds=60*60*24, member_limit=1)
                             if link:
                                 await bot.send_message(target_user_id, f"لینک عضویت در کانال: {link}")
                 else:
                     if NORMAL_CHANNEL_ID:
-                        link = await create_temporary_invite(NORMAL_CHANNEL_ID, expire_seconds=60 * 60 * 24, member_limit=1)
+                        link = await create_temporary_invite(NORMAL_CHANNEL_ID, expire_seconds=60*60*24, member_limit=1)
                         if link:
                             await bot.send_message(target_user_id, f"لینک عضویت در کانال معمولی: {link}")
-            except Exception as e:
-                logger.exception("Failed to DM user on confirm: %s", e)
+            except Exception:
+                logger.exception("Failed to DM user on confirm.")
             await callback_query.answer("خرید تأیید شد.")
         else:
-            await sheets_update(f"{PENDING_SHEET}!D{pending_row_idx}:D{pending_row_idx}", [["rejected"]])
+            # reject
+            row[6] = "rejected"
+            await sheets_update_row(PURCHASES_SHEET, purchase_row_idx, row)
             try:
                 await bot.send_message(target_user_id, "❌ خرید شما تایید نشد. لطفاً با پشتیبانی تماس بگیرید یا اطلاعات تراکنش را بررسی کنید.")
             except Exception:
@@ -654,54 +642,95 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
         logger.exception("Error processing admin callback: %s", e)
         await callback_query.answer("خطا در پردازش.")
 
-# -------------------------
-# Rebuild scheduled expiries from SUBS sheet on startup
-# -------------------------
+# Rebuild scheduled expiries from Subscription sheet on startup
 async def rebuild_schedules_from_subscriptions():
-    rows = await sheets_get(SUBS_RANGE)
-    if not rows or len(rows) <= 1:
-        logger.info("No subscriptions to rebuild.")
-        return
-    for idx, row in enumerate(rows[1:], start=2):
-        try:
-            user_id = int(row[0])
-            plan = row[1] if len(row) > 1 else ""
-            status = row[2] if len(row) > 2 else ""
-            expires_at = row[3] if len(row) > 3 else ""
-            expires_dt = parse_iso_or_none(expires_at)
-            if not expires_dt:
-                logger.error("rebuild row err: Invalid isoformat string: %r", expires_at)
-                continue
-            now = datetime.utcnow()
-            if expires_dt <= now:
-                # already expired: remove and mark expired
-                if plan == "premium":
-                    for ch in [NORMAL_CHANNEL_ID, PREMIUM_CHANNEL_ID]:
-                        if ch:
-                            asyncio.create_task(remove_user_from_chat(ch, user_id))
-                else:
-                    if NORMAL_CHANNEL_ID:
-                        asyncio.create_task(remove_user_from_chat(NORMAL_CHANNEL_ID, user_id))
-                await sheets_update(f"{SUBS_SHEET}!C{idx}:C{idx}", [["expired"]])
-            else:
-                delay = (expires_dt - now).total_seconds()
-                async def expire_job(chat_ids, uid, d):
-                    await asyncio.sleep(d)
-                    for ch in chat_ids:
-                        if ch:
-                            await remove_user_from_chat(ch, uid)
+    try:
+        rows = await sheets_get_all(SUBS_SHEET)
+        if not rows or len(rows) <= 1:
+            logger.info("No subscriptions to rebuild.")
+            return
+        for idx, row in enumerate(rows[1:], start=2):
+            try:
+                user_id = int(row[0])
+                plan = row[1] if len(row) > 1 else ""
+                expires_at = row[2] if len(row) > 2 else ""
+                expires_dt = parse_iso_or_none(expires_at)
+                if not expires_dt:
+                    logger.error("rebuild row err: Invalid isoformat string: %r", expires_at)
+                    continue
+                now = datetime.utcnow()
+                if expires_dt <= now:
+                    # already expired: remove and mark expired
+                    if plan == "premium":
+                        for ch in [NORMAL_CHANNEL_ID, PREMIUM_CHANNEL_ID]:
+                            if ch:
+                                asyncio.create_task(remove_user_from_chat(ch, user_id))
+                    else:
+                        if NORMAL_CHANNEL_ID:
+                            asyncio.create_task(remove_user_from_chat(NORMAL_CHANNEL_ID, user_id))
+                    # mark active=no
                     try:
-                        await bot.send_message(uid, "⏳ اشتراک شما به پایان رسید. جهت تمدید یا خرید مجدد به من مراجعه کنید.")
-                    except Exception as e:
-                        logger.debug("Could not DM user on subscription expiry: %s", e)
-                chat_ids = [PREMIUM_CHANNEL_ID, NORMAL_CHANNEL_ID] if plan == "premium" else [NORMAL_CHANNEL_ID]
-                asyncio.create_task(expire_job([ch for ch in chat_ids if ch], user_id, delay))
-        except Exception as e:
-            logger.exception("rebuild_schedules_from_subscriptions error: %s", e)
+                        row[4] = "no"
+                        await sheets_update_row(SUBS_SHEET, idx, row)
+                    except Exception:
+                        pass
+                else:
+                    delay = (expires_dt - now).total_seconds()
+                    async def expire_job(chat_ids, uid, d):
+                        await asyncio.sleep(d)
+                        for ch in chat_ids:
+                            if ch:
+                                await remove_user_from_chat(ch, uid)
+                        try:
+                            await bot.send_message(uid, "⏳ اشتراک شما به پایان رسید. جهت تمدید یا خرید مجدد به من مراجعه کنید.")
+                        except Exception:
+                            pass
+                    chat_ids = [PREMIUM_CHANNEL_ID, NORMAL_CHANNEL_ID] if plan == "premium" else [NORMAL_CHANNEL_ID]
+                    asyncio.create_task(expire_job([ch for ch in chat_ids if ch], user_id, delay))
+            except Exception:
+                logger.exception("Error rebuilding subscription row: %s", row)
+    except Exception:
+        logger.exception("rebuild_schedules_from_subscriptions failed")
 
-# -------------------------
-# Webserver, startup hooks
-# -------------------------
+# Admin command: reply to ticket
+@dp.message_handler(commands=["reply_ticket"])
+async def admin_reply_ticket(message: types.Message):
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != str(ADMIN_TELEGRAM_ID):
+        await message.answer("فقط ادمین مجاز است.")
+        return
+    parts = message.text.split(" ", 2)
+    if len(parts) < 3:
+        await message.answer("استفاده: /reply_ticket <ticket_id> <response message>")
+        return
+    ticket_id = parts[1].strip()
+    response_text = parts[2].strip()
+    try:
+        w = open_sheet(SUPPORT_SHEET)
+        vals = w.get_all_values()
+        found = False
+        for idx, row in enumerate(vals[1:], start=2):
+            if len(row) > 0 and row[0] == ticket_id:
+                while len(row) < 9:
+                    row.append("")
+                row[7] = response_text
+                row[8] = now_iso()
+                w.update(f"A{idx}:I{idx}", [row])
+                # send message to user
+                try:
+                    await bot.send_message(int(row[1]), f"📩 پاسخ پشتیبانی به تیکت {ticket_id}:\n\n{response_text}")
+                except Exception:
+                    logger.exception("Could not DM user for ticket response.")
+                found = True
+                break
+        if found:
+            await message.answer("✅ پاسخ ارسال و ثبت شد.")
+        else:
+            await message.answer("تیکت پیدا نشد.")
+    except Exception:
+        logger.exception("admin_reply_ticket error")
+        await message.answer("خطا در ارسال پاسخ.")
+
+# Webserver (health) & startup
 async def start_webserver():
     app = web.Application()
     async def handle_root(req):
@@ -715,27 +744,30 @@ async def start_webserver():
 
 async def on_startup(dp_obj):
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook deleted on startup.")
+        if INSTANCE_MODE == "polling":
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Webhook deleted on startup (polling mode).")
     except Exception:
         logger.exception("Failed to delete webhook on startup.")
     try:
         asyncio.create_task(start_webserver())
     except Exception:
         logger.exception("Failed to start webserver.")
-    # create pollers and ensure sheets
-    asyncio.create_task(poll_pending_notify_admin())
-    asyncio.create_task(rebuild_schedules_from_subscriptions())
-    for sname in [USERS_SHEET, SUBS_SHEET, PENDING_SHEET, SUPPORT_SHEET]:
+    # ensure sheets exist BEFORE starting pollers
+    for sname in [USERS_SHEET, PURCHASES_SHEET, REFERRALS_SHEET, SUPPORT_SHEET, SUBS_SHEET, CONFIG_SHEET]:
         try:
-            await ensure_sheet_exists(sname)
+            open_sheet(sname)
         except Exception:
             logger.exception("Failed to ensure sheet exists: %s", sname)
+    # start background tasks AFTER sheets ensured
+    try:
+        asyncio.create_task(poll_pending_notify_admin())
+        asyncio.create_task(rebuild_schedules_from_subscriptions())
+    except Exception:
+        logger.exception("Failed to create background tasks.")
 
-# -------------------------
 # Robust polling wrapper
-# -------------------------
-def run_polling_with_retries(skip_updates: bool = True, max_retries: int = 20):
+def run_polling_with_retries(skip_updates: bool = True, max_retries: int = 10):
     attempt = 0
     while True:
         attempt += 1
@@ -746,12 +778,8 @@ def run_polling_with_retries(skip_updates: bool = True, max_retries: int = 20):
             break
         except TerminatedByOtherGetUpdates as e:
             logger.warning("TerminatedByOtherGetUpdates: %s", e)
-            wait = min(60, 5 * attempt)
-            logger.info("Sleeping %d seconds before retrying...", wait)
-            time.sleep(wait)
-            if attempt >= max_retries:
-                logger.error("Max retries reached for TerminatedByOtherGetUpdates.")
-                break
+            logger.error("Detected another running instance (same token). Exiting. Ensure only one bot instance is running.")
+            break
         except Exception as e:
             logger.exception("Unhandled exception in polling: %s", e)
             wait = min(60, 5 * attempt)
@@ -760,10 +788,10 @@ def run_polling_with_retries(skip_updates: bool = True, max_retries: int = 20):
                 logger.error("Max retries reached for polling.")
                 break
 
-# -------------------------
 # Entry point
-# -------------------------
 if __name__ == "__main__":
     logger.info("=== BOT STARTING ===")
     print("=== BOT STARTING ===")
+    if INSTANCE_MODE == "webhook":
+        logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
