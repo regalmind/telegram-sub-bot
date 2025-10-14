@@ -521,34 +521,50 @@ async def notify_admin_pending(pending_row: List[str]):
         logger.exception("Failed to send admin notify.")
 
 # Poller: scan Purchases sheet, notify admin about pending rows with inline confirm/reject
+# >>> جایگزین کامل تابع poll_pending_notify_admin با این بلوک کن <<<
+
 async def poll_pending_notify_admin():
+    """
+    Poll Purchases sheet for pending purchases and notify admin with inline confirm/reject.
+    این نسخه به‌طور واضح try/except ها را بسته و از خطاهای Indentation جلوگیری می‌کند.
+    """
     await asyncio.sleep(2)
     while True:
         try:
             rows = await sheets_get_all(PURCHASES_SHEET)
             if rows and len(rows) > 1:
                 for idx, row in enumerate(rows[1:], start=2):
+                    # هر ردیف را با try جداگانه پوشش می‌دهیم تا خطای یک ردیف حلقه را نشکند
                     try:
                         status = (row[6] if len(row) > 6 else "").lower()
                         admin_note = (row[10] if len(row) > 10 else "")
                         if status == "pending" and not admin_note:
                             if not ADMIN_TELEGRAM_ID:
+                                # اگر ادمین تنظیم نشده، نوتیفای کردن بی‌معنی است
                                 break
-                            user_id = int(row[0]) if row and row[0].isdigit() else 0
-                            msg = f"🔔 Pending purchase (row {idx})\nUser: {row[0]}\nName: {row[1]}\nInfo: {row[5]}\nTime: {row[7]}"
+                            user_id = 0
+                            try:
+                                user_id = int(row[0]) if row and str(row[0]).isdigit() else 0
+                            except Exception:
+                                user_id = 0
+                            msg = f"🔔 Pending purchase (row {idx})\nUser: {row[0] if len(row)>0 else ''}\nName: {row[1] if len(row)>1 else ''}\nInfo: {row[5] if len(row)>5 else ''}\nTime: {row[7] if len(row)>7 else ''}"
                             try:
                                 await bot.send_message(int(ADMIN_TELEGRAM_ID), msg, reply_markup=admin_confirm_keyboard(idx, user_id))
                                 # mark notified time in admin_note column (index 10 / col K)
-                                # ensure row length
                                 while len(row) < 11:
                                     row.append("")
                                 row[10] = now_iso()
                                 await sheets_update_row(PURCHASES_SHEET, idx, row)
                             except Exception:
                                 logger.exception("Failed to notify admin about pending row %s", idx)
+                    except Exception:
+                        # خطای پردازش یک ردیف را لاگ کن و ادامه بده
+                        logger.exception("Error processing purchase row %s", idx)
+            # صبر بین هر دور polling
             await asyncio.sleep(12)
         except Exception as e:
             logger.exception("poll_pending_notify_admin loop error: %s", e)
+            # اگر خطای کلی رخ داد، با تأخیر بیشتری تلاش کن
             await asyncio.sleep(20)
 
 # Callback handler for confirm/reject
@@ -795,3 +811,4 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
