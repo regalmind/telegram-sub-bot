@@ -146,7 +146,7 @@ CONFIG_SHEET = "Config"  # for editable platform info and keys
 
 HEADERS = {
     USERS_SHEET: ["telegram_id", "full_name", "email", "referral_code", "referred_by", "status", "purchase_status", "expires_at", "created_at", "last_seen", "notes"],
-    PURCHASES_SHEET: ["telegram_id", "full_name", "email", "product", "amount", "transaction_info", "status", "request_at", "activated_at", "expires_at", "admin_note"],
+    PURCHASES_SHEET: ["telegram_id", "full_name", "email", "product", "amount", "transaction_info", "status", "request_at", "activated_at", "expires_at", "joined_at", "left_at", "admin_note"],
     REFERRALS_SHEET: ["telegram_id", "referral_code", "referred_count", "created_at"],
     SUPPORT_SHEET: ["ticket_id", "telegram_id", "full_name", "subject", "message", "status", "created_at", "response", "responded_at"],
     SUBS_SHEET: ["telegram_id", "product", "activated_at", "expires_at", "active"],
@@ -826,5 +826,6 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
