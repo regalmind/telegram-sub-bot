@@ -13,6 +13,7 @@ import random
 import string
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, types, executor
@@ -193,6 +194,22 @@ async def sheets_append(ws_name: str, row: List[Any]) -> bool:
         logger.exception("sheets_append failed for sheet %s", ws_name)
         return False
 
+async def sheets_append_return_index(ws_name: str, row: List[Any]) -> int:
+    """
+    Append row to worksheet and return the 1-based row index of the appended row.
+    Returns -1 on failure.
+    """
+    # sanitize
+    row = [str(x)[:2000] if x is not None else "" for x in row]
+    try:
+        w = open_sheet(ws_name)
+        w.append_row(row, value_input_option="USER_ENTERED")
+        vals = w.get_all_values()
+        return len(vals)  # appended row will be last
+    except Exception:
+        logger.exception("sheets_append_return_index failed for sheet %s", ws_name)
+        return -1
+
 async def sheets_get_all(ws_name: str) -> List[List[str]]:
     try:
         w = open_sheet(ws_name)
@@ -228,8 +245,16 @@ async def sheets_update_row(ws_name: str, row_idx: int, values: List[Any]) -> bo
 # -------------------------
 # Helpers (time, referral, parse)
 # -------------------------
+
 def now_iso() -> str:
-    return datetime.utcnow().replace(microsecond=0).isoformat()
+    """
+    Return current time as ISO string in Asia/Tehran timezone (no microseconds).
+    """
+    try:
+        return datetime.now(tz=ZoneInfo("Asia/Tehran")).replace(microsecond=0).isoformat()
+    except Exception:
+        # fallback to UTC if zoneinfo not available
+        return datetime.utcnow().replace(microsecond=0).isoformat()
 
 def parse_iso_or_none(s: str) -> Optional[datetime]:
     if not s:
@@ -315,7 +340,10 @@ async def remove_user_from_chat(chat_id: str, user_id: int) -> bool:
         logger.exception("Failed to remove user %s from chat %s: %s", user_id, chat_id, e)
         return False
 
-async def schedule_remove_after(chat_id: str, user_id: int, delay_seconds: int = 600):
+async def schedule_remove_after(chat_id: str, user_id: int, delay_seconds: int = 600, purchase_row_idx: Optional[int] = None):
+    """
+    Schedule removal and optionally update Purchases sheet row (joined_at/left_at).
+    """
     if user_id in scheduled_removals:
         scheduled_removals[user_id].cancel()
     async def job():
@@ -323,6 +351,21 @@ async def schedule_remove_after(chat_id: str, user_id: int, delay_seconds: int =
             await asyncio.sleep(delay_seconds)
             ok = await remove_user_from_chat(chat_id, user_id)
             if ok:
+                # update left_at in Purchases if row idx provided
+                if purchase_row_idx and purchase_row_idx > 0:
+                    try:
+                        rows = await sheets_get_all(PURCHASES_SHEET)
+                        if rows and len(rows) >= purchase_row_idx:
+                            row = rows[purchase_row_idx - 1]
+                            # ensure row length
+                            while len(row) < len(HEADERS[PURCHASES_SHEET]):
+                                row.append("")
+                            # joined_at likely already set; set left_at
+                            left_col_index = HEADERS[PURCHASES_SHEET].index("left_at")
+                            row[left_col_index] = now_iso()
+                            await sheets_update_row(PURCHASES_SHEET, purchase_row_idx, row)
+                    except Exception:
+                        logger.exception("Failed to update left_at for purchase row %s", purchase_row_idx)
                 try:
                     kb = build_main_keyboard()
                     await bot.send_message(user_id, "⏳ مدت تست کانال به پایان رسید. برای ادامه اشتراک‌ها به منو مراجعه کنید.", reply_markup=kb)
@@ -442,8 +485,12 @@ async def test_channel(message: types.Message):
         await message.answer("⚠️ لینک دعوت ایجاد نشد. مطمئن شوید ربات ادمین کانال تست است.")
         return
     await message.answer("⏳ لینک عضویت موقت برای شما ایجاد شد (۱۰ دقیقه):\n" + invite, disable_web_page_preview=True)
-    await schedule_remove_after(TEST_CHANNEL_ID, message.from_user.id, delay_seconds=600)
-    await sheets_append(PURCHASES_SHEET, [str(message.from_user.id), message.from_user.full_name or "", "", "trial", "0", "test_invite", "trial", now_iso(), "", "", ""])
+    # write purchase/trial row and get its index
+    joined_at = now_iso()
+    row = [str(message.from_user.id), message.from_user.full_name or "", "", "trial", "0", "test_invite", "trial", joined_at, "", "", joined_at, ""]
+    row_idx = await sheets_append_return_index(PURCHASES_SHEET, row)
+    # schedule removal and ensure we can update left_at when removing
+    await schedule_remove_after(TEST_CHANNEL_ID, message.from_user.id, delay_seconds=20, purchase_row_idx=row_idx)
 
 @dp.message_handler(lambda msg: msg.text == "خرید کانال معمولی")
 async def buy_normal(message: types.Message):
@@ -572,37 +619,73 @@ async def poll_pending_notify_admin():
 # Callback handler for confirm/reject
 @dp.callback_query_handler(lambda c: c.data and (c.data.startswith("confirm:") or c.data.startswith("reject:")))
 async def process_admin_confirmation(callback_query: types.CallbackQuery):
+    """
+    Handle admin confirm/reject for purchases.
+    Replaces the previous partial implementation — complete and robust.
+    """
     data = callback_query.data
     parts = data.split(":")
-    action = parts[0]
+    action = parts[0] if parts else ""
     try:
         purchase_row_idx = int(parts[1])
         target_user_id = int(parts[2])
     except Exception:
         await callback_query.answer("فرمت داده نامعتبر.", show_alert=True)
         return
+
     try:
         rows = await sheets_get_all(PURCHASES_SHEET)
         if not rows or purchase_row_idx - 1 >= len(rows):
             await callback_query.answer("ردیف موجود نیست یا قبلا تغییر کرده.", show_alert=True)
             return
         row = rows[purchase_row_idx - 1]
-        # ensure row has enough columns
-        while len(row) < 11:
+        # ensure row length matches headers
+        expected_len = len(HEADERS.get(PURCHASES_SHEET, []))
+        while len(row) < expected_len:
             row.append("")
+
+        header = HEADERS.get(PURCHASES_SHEET, [])
+        # helpful index lookup (defensive)
+        def idx_of(col_name, default=-1):
+            try:
+                return header.index(col_name)
+            except Exception:
+                return default
+
+        status_idx = idx_of("status", 6)
+        trans_info_idx = idx_of("transaction_info", 5)
+        activated_idx = idx_of("activated_at", 8)
+        expires_idx = idx_of("expires_at", 9)
+        joined_idx = idx_of("joined_at", 10)
+        left_idx = idx_of("left_at", 11)
+        admin_note_idx = idx_of("admin_note", 12)
+
         if action == "confirm":
-            # set status = confirmed
-            row[6] = "confirmed"
+            # update row: status, activated_at, expires_at
+            row[status_idx] = "confirmed"
             activated = now_iso()
-            expires = (datetime.utcnow() + timedelta(days=30*6)).replace(microsecond=0).isoformat()
-            row[8] = activated
-            row[9] = expires
+            # expires = 6 months from now in Asia/Tehran
+            try:
+                expires_dt = datetime.now(tz=ZoneInfo("Asia/Tehran")) + timedelta(days=30*6)
+                expires = expires_dt.replace(microsecond=0).isoformat()
+            except Exception:
+                expires = (datetime.utcnow() + timedelta(days=30*6)).replace(microsecond=0).isoformat()
+
+            row[activated_idx] = activated
+            row[expires_idx] = expires
+            # mark admin_note as time-notified to avoid re-notify
+            row[admin_note_idx] = now_iso()
             await sheets_update_row(PURCHASES_SHEET, purchase_row_idx, row)
-            # append subscription
+
+            # append subscription row and capture its index
             plan = "premium" if ("premium" in (row[3] or "").lower()) else "normal"
             sub_row = [str(target_user_id), plan, activated, expires, "yes"]
-            await sheets_append(SUBS_SHEET, sub_row)
-            # update Users sheet for this user
+            try:
+                sub_idx = await sheets_append_return_index(SUBS_SHEET, sub_row)
+            except Exception:
+                sub_idx = -1
+
+            # update Users sheet: set purchase_status/expires and referral code if missing
             try:
                 u_w = open_sheet(USERS_SHEET)
                 u_vals = u_w.get_all_values()
@@ -613,25 +696,70 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
                         u_row = ur
                         break
                 if found_idx:
-                    while len(u_row) < 11:
+                    while len(u_row) < len(HEADERS[USERS_SHEET]):
                         u_row.append("")
-                    u_row[6] = "active"
-                    u_row[7] = expires
-                    if not u_row[3]:
-                        u_row[3] = generate_referral_code()
+                    # purchase_status -> column name 'purchase_status' at index 6 in HEADERS
+                    try:
+                        u_row[HEADERS[USERS_SHEET].index("purchase_status")] = "active"
+                    except Exception:
+                        u_row[6] = "active"
+                    try:
+                        u_row[HEADERS[USERS_SHEET].index("expires_at")] = expires
+                    except Exception:
+                        u_row[7] = expires
+                    # ensure referral code exists
+                    try:
+                        if not u_row[HEADERS[USERS_SHEET].index("referral_code")]:
+                            u_row[HEADERS[USERS_SHEET].index("referral_code")] = generate_referral_code()
+                    except Exception:
+                        if len(u_row) > 3 and not u_row[3]:
+                            u_row[3] = generate_referral_code()
                     u_w.update(f"A{found_idx}:K{found_idx}", [u_row])
             except Exception:
                 logger.exception("Failed to update Users after confirm.")
-            # DM user with referral + invite links
+
+            # --- referral detection from transaction_info (simple token scan) ---
             try:
+                trans_info = row[trans_info_idx] if trans_info_idx >= 0 else ""
+                if trans_info:
+                    for token in (trans_info or "").split():
+                        candidate = token.strip()
+                        if not candidate:
+                            continue
+                        # try to find referrer
+                        ref_found = find_user_by_referral_code(candidate)
+                        if ref_found and str(ref_found) != str(target_user_id):
+                            increment_referral_count(ref_found)
+                            # set referred_by in Users
+                            try:
+                                u_w = open_sheet(USERS_SHEET)
+                                u_vals = u_w.get_all_values()
+                                for i, ur in enumerate(u_vals[1:], start=2):
+                                    if len(ur) > 0 and str(ur[0]) == str(target_user_id):
+                                        while len(ur) < len(HEADERS[USERS_SHEET]):
+                                            ur.append("")
+                                        ur[HEADERS[USERS_SHEET].index("referred_by")] = str(ref_found) if "referred_by" in HEADERS[USERS_SHEET] else str(ref_found)
+                                        u_w.update(f"A{i}:K{i}", [ur])
+                                        break
+                            except Exception:
+                                logger.exception("Failed to set referred_by for user %s", target_user_id)
+                            break
+            except Exception:
+                logger.exception("Referral detection failed for purchase row %s", purchase_row_idx)
+
+            # DM user and send invite links
+            try:
+                # fetch referral for message
                 referral = ""
                 try:
                     uvals = open_sheet(USERS_SHEET).get_all_values()
                     for ur in uvals[1:]:
                         if ur and len(ur) > 0 and str(ur[0]) == str(target_user_id):
                             referral = ur[3] if len(ur) > 3 else ""
+                            break
                 except Exception:
                     pass
+
                 await bot.send_message(target_user_id, "🎉 پرداخت شما تایید شد. اشتراک شما فعال شد.\nکد معرفی شما: " + (referral or generate_referral_code()))
                 if plan == "premium":
                     for ch in [NORMAL_CHANNEL_ID, PREMIUM_CHANNEL_ID]:
@@ -646,10 +774,13 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
                             await bot.send_message(target_user_id, f"لینک عضویت در کانال معمولی: {link}")
             except Exception:
                 logger.exception("Failed to DM user on confirm.")
+
             await callback_query.answer("خرید تأیید شد.")
         else:
-            # reject
-            row[6] = "rejected"
+            # reject flow
+            row[status_idx] = "rejected"
+            # write admin note/time so it won't be re-notified
+            row[admin_note_idx] = now_iso()
             await sheets_update_row(PURCHASES_SHEET, purchase_row_idx, row)
             try:
                 await bot.send_message(target_user_id, "❌ خرید شما تایید نشد. لطفاً با پشتیبانی تماس بگیرید یا اطلاعات تراکنش را بررسی کنید.")
@@ -658,57 +789,73 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
             await callback_query.answer("خرید رد شد.")
     except Exception as e:
         logger.exception("Error processing admin callback: %s", e)
-        await callback_query.answer("خطا در پردازش.")
+        try:
+            await callback_query.answer("خطا در پردازش.", show_alert=True)
+        except Exception:
+            pass
 
 # Rebuild scheduled expiries from Subscription sheet on startup
-async def rebuild_schedules_from_subscriptions():
+async def mark_subscription_expired(user_id: int, expires_at_iso: str):
+    """
+    Mark subscription row active=no in SUBS_SHEET for given user and expires_at (if matches).
+    """
     try:
         rows = await sheets_get_all(SUBS_SHEET)
-        if not rows or len(rows) <= 1:
-            logger.info("No subscriptions to rebuild.")
+        if not rows:
             return
+        header = rows[0]
         for idx, row in enumerate(rows[1:], start=2):
             try:
-                user_id = int(row[0])
-                plan = row[1] if len(row) > 1 else ""
-                expires_at = row[2] if len(row) > 2 else ""
-                expires_dt = parse_iso_or_none(expires_at)
-                if not expires_dt:
-                    logger.error("rebuild row err: Invalid isoformat string: %r", expires_at)
-                    continue
-                now = datetime.utcnow()
-                if expires_dt <= now:
-                    # already expired: remove and mark expired
-                    if plan == "premium":
-                        for ch in [NORMAL_CHANNEL_ID, PREMIUM_CHANNEL_ID]:
-                            if ch:
-                                asyncio.create_task(remove_user_from_chat(ch, user_id))
+                if len(row) > 0 and str(row[0]) == str(user_id):
+                    # if expires_at_iso provided, check match (loose)
+                    if expires_at_iso and len(row) > 3 and row[3] and row[3] != expires_at_iso:
+                        # mismatch — still continue to next
+                        continue
+                    # ensure columns
+                    while len(row) < len(header):
+                        row.append("")
+                    if "active" in header:
+                        row[header.index("active")] = "no"
                     else:
-                        if NORMAL_CHANNEL_ID:
-                            asyncio.create_task(remove_user_from_chat(NORMAL_CHANNEL_ID, user_id))
-                    # mark active=no
-                    try:
-                        row[4] = "no"
-                        await sheets_update_row(SUBS_SHEET, idx, row)
-                    except Exception:
-                        pass
-                else:
-                    delay = (expires_dt - now).total_seconds()
-                    async def expire_job(chat_ids, uid, d):
-                        await asyncio.sleep(d)
-                        for ch in chat_ids:
-                            if ch:
-                                await remove_user_from_chat(ch, uid)
-                        try:
-                            await bot.send_message(uid, "⏳ اشتراک شما به پایان رسید. جهت تمدید یا خرید مجدد به من مراجعه کنید.")
-                        except Exception:
-                            pass
-                    chat_ids = [PREMIUM_CHANNEL_ID, NORMAL_CHANNEL_ID] if plan == "premium" else [NORMAL_CHANNEL_ID]
-                    asyncio.create_task(expire_job([ch for ch in chat_ids if ch], user_id, delay))
+                        # fallback: last col
+                        row[-1] = "no"
+                    await sheets_update_row(SUBS_SHEET, idx, row)
+                    return
             except Exception:
-                logger.exception("Error rebuilding subscription row: %s", row)
+                continue
     except Exception:
-        logger.exception("rebuild_schedules_from_subscriptions failed")
+        logger.exception("mark_subscription_expired failed for %s", user_id)
+
+async def mark_subscription_expired(user_id: int, expires_at_iso: str):
+    """
+    Mark subscription row active=no in SUBS_SHEET for given user and expires_at (if matches).
+    """
+    try:
+        rows = await sheets_get_all(SUBS_SHEET)
+        if not rows:
+            return
+        header = rows[0]
+        for idx, row in enumerate(rows[1:], start=2):
+            try:
+                if len(row) > 0 and str(row[0]) == str(user_id):
+                    # if expires_at_iso provided, check match (loose)
+                    if expires_at_iso and len(row) > 3 and row[3] and row[3] != expires_at_iso:
+                        # mismatch — still continue to next
+                        continue
+                    # ensure columns
+                    while len(row) < len(header):
+                        row.append("")
+                    if "active" in header:
+                        row[header.index("active")] = "no"
+                    else:
+                        # fallback: last col
+                        row[-1] = "no"
+                    await sheets_update_row(SUBS_SHEET, idx, row)
+                    return
+            except Exception:
+                continue
+    except Exception:
+        logger.exception("mark_subscription_expired failed for %s", user_id)
 
 # Admin command: reply to ticket
 @dp.message_handler(commands=["reply_ticket"])
@@ -826,6 +973,7 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
 
