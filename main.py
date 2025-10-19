@@ -398,158 +398,133 @@ def admin_confirm_keyboard(purchase_row_index: int, user_id: int):
     return kb
 
 # -------------------------
-# Membership check (required channels)
-# -------------------------
-from aiogram.utils.exceptions import BadRequest
-
+# --- Membership helpers و دکمهٔ بررسی عضویت تک‌کلیک ---
 async def is_member_of(chat_id: str, user_id: int) -> bool:
     """
-    Returns True if user_id appears to be a member of chat_id.
-    Handles BadRequest "Member list is inaccessible" gracefully and returns False.
+    Check whether user_id is a member of chat_id.
+    chat_id can be '@username' or numeric '-100...' id (string).
+    Returns False on any error (and logs warning).
     """
     try:
         mem = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        status = getattr(mem, "status", "")
-        return status not in ("left", "kicked")
-    except BadRequest as e:
-        msg = str(e)
-        # این خطا وقتی رخ می‌دهد که ربات اجازهٔ دسترسی به لیست اعضا را ندارد
-        if "Member list is inaccessible" in msg or "members are unavailable" in msg or "chat not found" in msg.lower():
-            logger.warning("Bot cannot access member list for chat %s: %s", chat_id, msg)
-            # بازگرداندن False باعث می‌شود کاربر تشویق شود عضو شود.
-            # همچنین می‌توان ادمین را یک‌بار مطلع کرد (دلخواه).
-            return False
-        # اگر خطای دیگری است، لاگ کن و False برگردان
-        logger.exception("is_member_of BadRequest for chat %s user %s: %s", chat_id, user_id, e)
-        return False
+        status = getattr(mem, "status", None)  # safe
+        # treat 'left' and 'kicked' as not a member
+        return status not in ("left", "kicked", None)
     except Exception as e:
-        logger.exception("is_member_of error for chat %s user %s: %s", chat_id, user_id, e)
+        # Common Telegram error: "Member list is inaccessible"
+        # Log and return False so user is asked to join manually.
+        logger.warning("is_member_of error for chat %s user %s: %s", chat_id, user_id, e)
         return False
 
-# -------------------------
-# Handlers: start, email, menu
-# -------------------------
+async def enforce_required_channels(user_id: int) -> Tuple[bool, List[str]]:
+    """
+    Return (ok, missing_list).
+    ok == True if user is member of all REQUIRED_CHANNELS_LIST.
+    missing_list contains channel identifiers (as strings) the user is not member of.
+    """
+    not_member = []
+    # if no required channels configured, treat as OK
+    if not REQUIRED_CHANNELS_LIST:
+        return True, []
+    for ch in REQUIRED_CHANNELS_LIST:
+        # skip empty strings
+        ch = ch.strip()
+        if not ch:
+            continue
+        try:
+            ok = await is_member_of(ch, user_id)
+            if not ok:
+                not_member.append(ch)
+        except Exception as e:
+            logger.exception("enforce_required_channels check error for %s %s", ch, e)
+            not_member.append(ch)
+    return (len(not_member) == 0, not_member)
+
+
+# --- Updated /start handler with single-click membership check ---
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
-    """
-    /start با دکمهٔ یک‌کلیک برای بررسی عضویت:
-    - اگر کاربر عضو همه REQUIRED_CHANNELS نبود: لیست کانال‌ها + لینک عضویت (برای username دارها)
-      و دکمهٔ inline "✅ بررسی عضویت" نمایش داده می‌شود.
-    - اگر عضو بود: ردیف کاربر در شیت اطمینان داده می‌شود و منوی اصلی نمایش داده می‌شود.
-    """
     try:
         ok_membership, missing = await enforce_required_channels(message.from_user.id)
-
         if not ok_membership:
-            # پیام و دکمه‌های عضویت برای کانال‌هایی که username دارند
+            # build user-friendly list with t.me links when possible
             text_lines = [
-                "⚠️ برای استفاده از ربات باید در کانال‌های زیر عضو باشید. لطفاً ابتدا عضو شوید:",
-                ""
+                "⚠️ برای استفاده از ربات باید در کانال‌های زیر عضو شوید. پس از عضویت روی دکمه «✅ بررسی عضویت» بزنید:"
             ]
-            kb = types.InlineKeyboardMarkup(row_width=1)
             for ch in missing:
-                # نمایش نام/آیدی کانال در پیام
-                text_lines.append(str(ch))
-                # اگر یوزرنیم موجود است، دکمهٔ لینک t.me بساز
                 if isinstance(ch, str) and ch.startswith("@"):
-                    kb.add(types.InlineKeyboardButton(text=f"عضویت در {ch}", url=f"https://t.me/{ch.lstrip('@')}"))
+                    text_lines.append(f"• {ch} — https://t.me/{ch.lstrip('@')}")
+                else:
+                    # numeric id or unknown: just show raw
+                    text_lines.append(f"• {ch}")
+            text = "\n".join(text_lines)
 
-            text_lines.append("")
-            text_lines.append("پس از عضویت، روی دکمهٔ «بررسی عضویت» کلیک کنید تا وضعیت شما بررسی شده و منو نمایش داده شود.")
-            # دکمهٔ بررسی عضویت (تک‌کلیک)
-            kb.add(types.InlineKeyboardButton(text="✅ بررسی عضویت", callback_data="check_membership"))
+            kb = types.InlineKeyboardMarkup()
+            kb.add(types.InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_membership"))
+            # also provide a small row with a link to contact admin (optional)
+            if ADMIN_TELEGRAM_ID:
+                try:
+                    kb.add(types.InlineKeyboardButton("👤 تماس با ادمین", url=f"https://t.me/{ADMIN_TELEGRAM_ID}" if str(ADMIN_TELEGRAM_ID).startswith("@") else f"https://t.me/{ADMIN_TELEGRAM_ID}"))
+                except Exception:
+                    pass
 
-            # ارسال پیام (اگر هیچ لینک عضویتی قابل ساخت نبود، باز هم دکمهٔ بررسی وجود دارد)
-            await message.answer("\n".join(text_lines), reply_markup=kb)
+            await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
             return
 
-        # اگر عضو همه کانال‌ها بودیم:
-        try:
-            ensure_user_row_and_return(message.from_user)
-        except Exception:
-            logger.exception("ensure_user_row_and_return failed in /start for user %s", message.from_user.id)
-
+        # if membership OK, ensure user row and show main keyboard
+        ensure_user_row_and_return(message.from_user)
         kb = build_main_keyboard()
         await message.answer("👋 خوش آمدید! منوی اصلی:", reply_markup=kb)
-
     except Exception as e:
         logger.exception("Error in /start: %s", e)
-        try:
-            await message.answer("خطا در شروع. لطفا بعداً تلاش کنید.")
-        except Exception:
-            logger.exception("Also failed to send fallback error message to user %s", getattr(message.from_user, "id", "<unknown>"))
+        await message.answer("خطا در شروع. لطفا بعداً تلاش کنید.")
 
 
+# --- Callback handler for single-click membership check ---
 @dp.callback_query_handler(lambda c: c.data == "check_membership")
 async def cb_check_membership(callback_query: types.CallbackQuery):
     """
-    Handler دکمهٔ «بررسی عضویت».
-    وقتی کاربر روی دکمه کلیک کند، وضعیت عضویت را دوباره چک می‌کند.
-    اگر همه چیز اوکی بود، منوی اصلی را می‌فرستد؛ در غیر این صورت لیست کانال‌های باقی‌مانده و لینک‌ها را نمایش می‌دهد.
+    When user clicks '✅ بررسی عضویت', re-check required channels and either show menu or tell which channels still missing.
     """
     user = callback_query.from_user
-    user_id = user.id
     try:
-        ok_membership, missing = await enforce_required_channels(user_id)
-
+        ok_membership, missing = await enforce_required_channels(user.id)
         if ok_membership:
-            # اطمینان از ردیف کاربر و نمایش منو
+            # mark user row and show main menu
+            ensure_user_row_and_return(user)
+            kb = build_main_keyboard()
             try:
-                ensure_user_row_and_return(user)
-            except Exception:
-                logger.exception("ensure_user_row_and_return failed during membership check for %s", user_id)
-
-            try:
-                await callback_query.answer("✅ عضویت تأیید شد. منو در حال نمایش است.", show_alert=False)
+                await callback_query.answer("عضویت تأیید شد.", show_alert=False)
             except Exception:
                 pass
-
-            kb = build_main_keyboard()
-            # سعی کن پیام قبلی را ویرایش کنی تا UI تمیزتر بشود؛ در صورت خطا پیام جدید بفرست
             try:
-                await callback_query.message.edit_text("✅ عضویت شما در کانال‌ها تأیید شد. منوی اصلی:", reply_markup=None)
-                await callback_query.message.reply("👋 منوی اصلی:", reply_markup=kb)
+                await bot.send_message(user.id, "✅ عضویت شما در کانال(ها) تأیید شد. منوی اصلی:", reply_markup=kb)
             except Exception:
-                # fallback
-                try:
-                    await bot.send_message(user_id, "👋 منوی اصلی:", reply_markup=kb)
-                except Exception:
-                    logger.exception("Failed to send main menu to user %s after membership check", user_id)
-            return
-
-        # هنوز عضو نیست -> نشان دادن کانال‌های باقی‌مانده و لینک‌ها
-        text_lines = ["⚠️ هنوز عضو کانال‌های زیر نیستید:", ""]
-        kb = types.InlineKeyboardMarkup(row_width=1)
-        for ch in missing:
-            text_lines.append(str(ch))
-            if isinstance(ch, str) and ch.startswith("@"):
-                kb.add(types.InlineKeyboardButton(text=f"عضویت در {ch}", url=f"https://t.me/{ch.lstrip('@')}"))
-
-        text_lines.append("")
-        text_lines.append("پس از عضویت، دوباره روی «بررسی عضویت» کلیک کنید.")
-        kb.add(types.InlineKeyboardButton(text="🔁 بررسی مجدد", callback_data="check_membership"))
-
-        try:
-            await callback_query.answer("وضعیت عضویت بررسی شد.", show_alert=False)
-        except Exception:
-            pass
-
-        try:
-            await callback_query.message.edit_text("\n".join(text_lines), reply_markup=kb)
-        except Exception:
-            # اگر ویرایش ممکن نبود، پیام جدید بفرست
+                logger.exception("Could not send main menu DM to user %s", user.id)
+        else:
+            # still missing some channels
+            text_lines = ["⚠️ هنوز به کانال(های) زیر ملحق نشده‌اید. لطفاً ابتدا عضو شوید و سپس دوباره بررسی کنید:"]
+            for ch in missing:
+                if isinstance(ch, str) and ch.startswith("@"):
+                    text_lines.append(f"• {ch} — https://t.me/{ch.lstrip('@')}")
+                else:
+                    text_lines.append(f"• {ch}")
+            text_lines.append("\nپس از عضویت روی دکمه «🔁 بررسی مجدد» بزنید.")
+            text = "\n".join(text_lines)
+            # prepare inline keyboard to re-check
+            kb2 = types.InlineKeyboardMarkup()
+            kb2.add(types.InlineKeyboardButton("🔁 بررسی مجدد", callback_data="check_membership"))
             try:
-                await bot.send_message(user_id, "\n".join(text_lines), reply_markup=kb)
+                await callback_query.answer("عضویت بررسی شد.", show_alert=False)
             except Exception:
-                logger.exception("Failed to notify user %s about missing channels", user_id)
-
+                pass
+            await bot.send_message(user.id, text, reply_markup=kb2, disable_web_page_preview=True)
     except Exception as e:
-        logger.exception("Error in cb_check_membership for user %s: %s", user_id, e)
+        logger.exception("Error in cb_check_membership: %s", e)
         try:
-            await callback_query.answer("خطا در بررسی عضویت. لطفاً دوباره تلاش کنید.", show_alert=True)
+            await callback_query.answer("خطا در بررسی عضویت. لطفا دوباره تلاش کنید.", show_alert=True)
         except Exception:
             pass
-
 @dp.message_handler(lambda msg: msg.text is not None and "@" in msg.text and "." in msg.text)
 async def handle_email(message: types.Message):
     email = message.text.strip()
@@ -1145,6 +1120,7 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
 
