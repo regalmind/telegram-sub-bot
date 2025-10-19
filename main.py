@@ -400,42 +400,94 @@ def admin_confirm_keyboard(purchase_row_index: int, user_id: int):
 # -------------------------
 # Membership check (required channels)
 # -------------------------
+from aiogram.utils.exceptions import BadRequest
+
 async def is_member_of(chat_id: str, user_id: int) -> bool:
+    """
+    Returns True if user_id appears to be a member of chat_id.
+    Handles BadRequest "Member list is inaccessible" gracefully and returns False.
+    """
     try:
         mem = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        status = mem.status  # 'creator', 'administrator', 'member', 'restricted', 'left', 'kicked'
+        status = getattr(mem, "status", "")
         return status not in ("left", "kicked")
+    except BadRequest as e:
+        msg = str(e)
+        # این خطا وقتی رخ می‌دهد که ربات اجازهٔ دسترسی به لیست اعضا را ندارد
+        if "Member list is inaccessible" in msg or "members are unavailable" in msg or "chat not found" in msg.lower():
+            logger.warning("Bot cannot access member list for chat %s: %s", chat_id, msg)
+            # بازگرداندن False باعث می‌شود کاربر تشویق شود عضو شود.
+            # همچنین می‌توان ادمین را یک‌بار مطلع کرد (دلخواه).
+            return False
+        # اگر خطای دیگری است، لاگ کن و False برگردان
+        logger.exception("is_member_of BadRequest for chat %s user %s: %s", chat_id, user_id, e)
+        return False
     except Exception as e:
         logger.exception("is_member_of error for chat %s user %s: %s", chat_id, user_id, e)
         return False
-
-async def enforce_required_channels(user_id: int) -> Tuple[bool, List[str]]:
-    not_member = []
-    for ch in REQUIRED_CHANNELS_LIST:
-        try:
-            ok = await is_member_of(ch, user_id)
-            if not ok:
-                not_member.append(ch)
-        except Exception:
-            not_member.append(ch)
-    return (len(not_member) == 0, not_member)
 
 # -------------------------
 # Handlers: start, email, menu
 # -------------------------
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
+    """
+    Improved /start:
+    - بررسی عضویت در کانال‌های مورد نیاز (REQUIRED_CHANNELS_LIST).
+    - اگر عضو نبود: نمایش لیست کانال‌ها و دکمهٔ عضویت (برای کانال‌هایی که username دارند).
+      سپس از کاربر می‌خواهد پس از عضویت دوباره /start را ارسال کند.
+    - اگر عضو بود: اطمینان از ردیف کاربر در شیت و نمایش منوی اصلی.
+    """
     try:
+        # ابتدا بررسی عضویت در کانال‌های اجباری
         ok_membership, missing = await enforce_required_channels(message.from_user.id)
+
         if not ok_membership:
-            await message.answer("⚠️ برای استفاده از ربات باید در کانال‌های مربوطه عضو باشید. لطفا ابتدا در کانال‌های زیر عضو شوید:\n" + "\n".join(missing))
+            # کاربر عضو نیست -> پیغام و دکمه‌های لینک عضویت برای کانال‌هایی که username دارند
+            text_lines = [
+                "⚠️ برای استفاده از ربات باید در کانال‌های زیر عضو باشید. لطفاً ابتدا عضو شوید:",
+                ""
+            ]
+            kb = types.InlineKeyboardMarkup(row_width=1)
+            for ch in missing:
+                # ch ممکنه "-100..." یا "@username" یا شناسه‌ی دیگری باشه
+                text_lines.append(str(ch))
+                if isinstance(ch, str) and ch.startswith("@"):
+                    url = f"https://t.me/{ch.lstrip('@')}"
+                    kb.add(types.InlineKeyboardButton(text=f"عضویت در {ch}", url=url))
+
+            text_lines.append("")
+            text_lines.append("پس از عضویت، لطفاً دوباره /start را ارسال کنید تا عضویت‌تان تأیید و منو نمایش داده شود.")
+            text = "\n".join(text_lines)
+
+            # اگر هیچ دکمه‌ای ساخته نشده (مثلاً کانال‌ها شناسهٔ -100 دارند و یوزرنیم ندارند)
+            if kb.inline_keyboard:
+                await message.answer(text, reply_markup=kb)
+            else:
+                # فقط متن نمایش داده می‌شود (کاربر باید از داخل تلگرام کانال را جستجو و عضو شود)
+                await message.answer(text)
             return
-        ensure_user_row_and_return(message.from_user)
+
+        # اگر به اینجا رسیدیم، کاربر عضو همهٔ کانال‌های اجباری است
+        # اطمینان از وجود/به‌روزرسانی ردیف کاربر در شیت Users
+        try:
+            ensure_user_row_and_return(message.from_user)
+        except Exception:
+            # نباید کاربر را بلاک کند؛ اما لاگ کن
+            logger.exception("Warning: ensure_user_row_and_return failed in /start for user %s", message.from_user.id)
+
+        # نمایش منوی اصلی
         kb = build_main_keyboard()
         await message.answer("👋 خوش آمدید! منوی اصلی:", reply_markup=kb)
+
     except Exception as e:
         logger.exception("Error in /start: %s", e)
-        await message.answer("خطا در شروع. لطفا بعداً تلاش کنید.")
+        # پیغام خطای عمومی برای کاربر
+        try:
+            await message.answer("خطا در شروع. لطفا بعداً تلاش کنید.")
+        except Exception:
+            # اگر حتی ارسال پیام هم خطا داد، لاگ کن و ادامه بده
+            logger.exception("Also failed to send fallback error message to user %s", getattr(message.from_user, "id", "<unknown>"))
 
 @dp.message_handler(lambda msg: msg.text is not None and "@" in msg.text and "." in msg.text)
 async def handle_email(message: types.Message):
@@ -1032,6 +1084,7 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
 
