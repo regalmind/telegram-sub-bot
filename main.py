@@ -575,45 +575,61 @@ async def notify_admin_pending(pending_row: List[str]):
 async def poll_pending_notify_admin():
     """
     Poll Purchases sheet for pending purchases and notify admin with inline confirm/reject.
-    این نسخه به‌طور واضح try/except ها را بسته و از خطاهای Indentation جلوگیری می‌کند.
+    Uses HEADERS to compute indices so it adapts to your Purchases sheet layout.
+    Sleep set to 20s for quicker testing; بازنشانی به 12 یا مقدار دلخواه بعداً.
     """
     await asyncio.sleep(2)
     while True:
         try:
             rows = await sheets_get_all(PURCHASES_SHEET)
+            header = HEADERS.get(PURCHASES_SHEET, [])
+            # helper to get index by column name, fallback to default
+            def hidx(name, default):
+                try:
+                    return header.index(name)
+                except Exception:
+                    return default
+
+            status_i = hidx("status", 6)
+            admin_note_i = hidx("admin_note", 12)
+            trans_i = hidx("transaction_info", 5)
+            request_i = hidx("request_at", 7)
+
             if rows and len(rows) > 1:
                 for idx, row in enumerate(rows[1:], start=2):
-                    # هر ردیف را با try جداگانه پوشش می‌دهیم تا خطای یک ردیف حلقه را نشکند
                     try:
-                        status = (row[6] if len(row) > 6 else "").lower()
-                        admin_note = (row[10] if len(row) > 10 else "")
+                        status = (row[status_i] if len(row) > status_i else "").lower()
+                        admin_note = (row[admin_note_i] if len(row) > admin_note_i else "")
                         if status == "pending" and not admin_note:
                             if not ADMIN_TELEGRAM_ID:
-                                # اگر ادمین تنظیم نشده، نوتیفای کردن بی‌معنی است
                                 break
                             user_id = 0
                             try:
                                 user_id = int(row[0]) if row and str(row[0]).isdigit() else 0
                             except Exception:
                                 user_id = 0
-                            msg = f"🔔 Pending purchase (row {idx})\nUser: {row[0] if len(row)>0 else ''}\nName: {row[1] if len(row)>1 else ''}\nInfo: {row[5] if len(row)>5 else ''}\nTime: {row[7] if len(row)>7 else ''}"
+                            msg = (
+                                f"🔔 Pending purchase (row {idx})\n"
+                                f"User: {row[0] if len(row)>0 else ''}\n"
+                                f"Name: {row[1] if len(row)>1 else ''}\n"
+                                f"Info: {row[trans_i] if len(row)>trans_i else ''}\n"
+                                f"Time: {row[request_i] if len(row)>request_i else ''}"
+                            )
                             try:
                                 await bot.send_message(int(ADMIN_TELEGRAM_ID), msg, reply_markup=admin_confirm_keyboard(idx, user_id))
-                                # mark notified time in admin_note column (index 10 / col K)
-                                while len(row) < 11:
+                                # mark admin_note column (avoid re-notify)
+                                while len(row) <= admin_note_i:
                                     row.append("")
-                                row[10] = now_iso()
+                                row[admin_note_i] = now_iso()
                                 await sheets_update_row(PURCHASES_SHEET, idx, row)
                             except Exception:
                                 logger.exception("Failed to notify admin about pending row %s", idx)
                     except Exception:
-                        # خطای پردازش یک ردیف را لاگ کن و ادامه بده
                         logger.exception("Error processing purchase row %s", idx)
-            # صبر بین هر دور polling
-            await asyncio.sleep(12)
+            # delay between polling rounds — set to 20s for testing
+            await asyncio.sleep(20)
         except Exception as e:
             logger.exception("poll_pending_notify_admin loop error: %s", e)
-            # اگر خطای کلی رخ داد، با تأخیر بیشتری تلاش کن
             await asyncio.sleep(20)
 
 # Callback handler for confirm/reject
@@ -794,6 +810,82 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
         except Exception:
             pass
 
+async def rebuild_schedules_from_subscriptions():
+    """
+    Rebuild scheduled expiry jobs from subscriptions sheet on startup.
+    Ensures mark_subscription_expired is called after removal.
+    """
+    try:
+        rows = await sheets_get_all(SUBS_SHEET)
+        if not rows or len(rows) <= 1:
+            logger.info("No subscriptions to rebuild.")
+            return
+        for idx, row in enumerate(rows[1:], start=2):
+            try:
+                if not row or len(row) == 0:
+                    continue
+                # basic values
+                user_id = int(row[0])
+                plan = row[1] if len(row) > 1 else ""
+                expires_at = row[3] if len(row) > 3 else ""
+                expires_dt = parse_iso_or_none(expires_at)
+                if not expires_dt:
+                    logger.error("rebuild row err: Invalid isoformat string: %r", expires_at)
+                    continue
+
+                # make everything timezone-aware (Asia/Tehran) for comparison
+                now = datetime.now(tz=ZoneInfo("Asia/Tehran"))
+                if expires_dt.tzinfo is None:
+                    try:
+                        expires_dt = expires_dt.replace(tzinfo=ZoneInfo("Asia/Tehran"))
+                    except Exception:
+                        pass
+
+                if expires_dt <= now:
+                    # already expired: remove and mark expired
+                    if plan == "premium":
+                        for ch in [NORMAL_CHANNEL_ID, PREMIUM_CHANNEL_ID]:
+                            if ch:
+                                asyncio.create_task(remove_user_from_chat(ch, user_id))
+                    else:
+                        if NORMAL_CHANNEL_ID:
+                            asyncio.create_task(remove_user_from_chat(NORMAL_CHANNEL_ID, user_id))
+                    # mark active = no in sheet
+                    try:
+                        while len(row) < len(HEADERS.get(SUBS_SHEET, [])):
+                            row.append("")
+                        if "active" in HEADERS.get(SUBS_SHEET, []):
+                            row[HEADERS[SUBS_SHEET].index("active")] = "no"
+                        await sheets_update_row(SUBS_SHEET, idx, row)
+                    except Exception:
+                        pass
+                else:
+                    delay = (expires_dt - now).total_seconds()
+                    async def expire_job(chat_ids, uid, d, exp_iso):
+                        try:
+                            await asyncio.sleep(d)
+                            for ch in chat_ids:
+                                if ch:
+                                    await remove_user_from_chat(ch, uid)
+                            try:
+                                await bot.send_message(uid, "⏳ اشتراک شما به پایان رسید. جهت تمدید یا خرید مجدد به من مراجعه کنید.")
+                            except Exception:
+                                pass
+                            # mark subscription expired in sheet
+                            try:
+                                await mark_subscription_expired(uid, exp_iso)
+                            except Exception:
+                                logger.exception("Failed to mark subscription expired for %s", uid)
+                        except Exception:
+                            logger.exception("Error in expire_job for user %s", uid)
+
+                    chat_ids = [PREMIUM_CHANNEL_ID, NORMAL_CHANNEL_ID] if plan == "premium" else [NORMAL_CHANNEL_ID]
+                    asyncio.create_task(expire_job([ch for ch in chat_ids if ch], user_id, delay, expires_at))
+            except Exception:
+                logger.exception("Error rebuilding subscription row: %s", row)
+    except Exception:
+        logger.exception("rebuild_schedules_from_subscriptions failed")
+
 # Rebuild scheduled expiries from Subscription sheet on startup
 async def mark_subscription_expired(user_id: int, expires_at_iso: str):
     """
@@ -809,7 +901,6 @@ async def mark_subscription_expired(user_id: int, expires_at_iso: str):
                 if len(row) > 0 and str(row[0]) == str(user_id):
                     # if expires_at_iso provided, check match (loose)
                     if expires_at_iso and len(row) > 3 and row[3] and row[3] != expires_at_iso:
-                        # mismatch — still continue to next
                         continue
                     # ensure columns
                     while len(row) < len(header):
@@ -817,38 +908,6 @@ async def mark_subscription_expired(user_id: int, expires_at_iso: str):
                     if "active" in header:
                         row[header.index("active")] = "no"
                     else:
-                        # fallback: last col
-                        row[-1] = "no"
-                    await sheets_update_row(SUBS_SHEET, idx, row)
-                    return
-            except Exception:
-                continue
-    except Exception:
-        logger.exception("mark_subscription_expired failed for %s", user_id)
-
-async def mark_subscription_expired(user_id: int, expires_at_iso: str):
-    """
-    Mark subscription row active=no in SUBS_SHEET for given user and expires_at (if matches).
-    """
-    try:
-        rows = await sheets_get_all(SUBS_SHEET)
-        if not rows:
-            return
-        header = rows[0]
-        for idx, row in enumerate(rows[1:], start=2):
-            try:
-                if len(row) > 0 and str(row[0]) == str(user_id):
-                    # if expires_at_iso provided, check match (loose)
-                    if expires_at_iso and len(row) > 3 and row[3] and row[3] != expires_at_iso:
-                        # mismatch — still continue to next
-                        continue
-                    # ensure columns
-                    while len(row) < len(header):
-                        row.append("")
-                    if "active" in header:
-                        row[header.index("active")] = "no"
-                    else:
-                        # fallback: last col
                         row[-1] = "no"
                     await sheets_update_row(SUBS_SHEET, idx, row)
                     return
@@ -973,6 +1032,7 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
 
