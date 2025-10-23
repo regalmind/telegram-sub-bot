@@ -513,62 +513,60 @@ async def enforce_required_channels(user_id: int) -> Tuple[bool, List[str]]:
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     try:
-        # parse referral code if provided: /start REF123
+        # parse possible referral code: /start REF
         parts = (message.text or "").split()
         ref_code = parts[1].strip() if len(parts) > 1 else ""
-        # ensure membership
+
+        # membership check
         ok_membership, missing = await enforce_required_channels(message.from_user.id)
         if not ok_membership:
-            # existing behavior (list channels + button)
-            text_lines = [
-                "⚠️ برای استفاده از ربات باید در کانال‌های زیر عضو شوید. پس از عضویت روی دکمه «✅ بررسی عضویت» بزنید:"
-            ]
+            # build inline keyboard with button links (clickable)
+            kb = types.InlineKeyboardMarkup(row_width=1)
             for ch in missing:
                 if isinstance(ch, str) and ch.startswith("@"):
-                    text_lines.append(f"• {ch} — https://t.me/{ch.lstrip('@')}")
+                    kb.add(types.InlineKeyboardButton(text=ch, url=f"https://t.me/{ch.lstrip('@')}"))
                 else:
-                    text_lines.append(f"• {ch}")
-            text = "\n".join(text_lines)
-            kb = types.InlineKeyboardMarkup()
+                    # numeric id or raw: still show as text button that opens a chat (if username unknown cannot open)
+                    kb.add(types.InlineKeyboardButton(text=str(ch), url=f"https://t.me/{str(ch).lstrip('-100')}"))
             kb.add(types.InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_membership"))
             if ADMIN_TELEGRAM_ID:
                 try:
                     kb.add(types.InlineKeyboardButton("👤 تماس با ادمین", url=f"https://t.me/{ADMIN_TELEGRAM_ID}" if str(ADMIN_TELEGRAM_ID).startswith("@") else f"https://t.me/{ADMIN_TELEGRAM_ID}"))
                 except Exception:
                     pass
-            await message.answer(text, reply_markup=kb, disable_web_page_preview=True)
-            # store possible referral in Users row even if not yet member (so it can be tied later)
-            if ref_code:
-                try:
-                    # ensure user row exists and set referred_by if possible
-                    idx, urow = ensure_user_row_and_return(message.from_user)
-                    if urow:
-                        while len(urow) < len(HEADERS[USERS_SHEET]):
-                            urow.append("")
-                        # write referred_by column index
-                        urow[HEADERS[USERS_SHEET].index("referred_by")] = ref_code
-                        open_sheet(USERS_SHEET).update(f"A{idx}:K{idx}", [urow])
-                except Exception:
-                    pass
+
+            # store referral if provided (will be written to Users row)
+            try:
+                idx, urow = ensure_user_row_and_return(message.from_user)
+                if ref_code:
+                    while len(urow) < len(HEADERS[USERS_SHEET]):
+                        urow.append("")
+                    urow[HEADERS[USERS_SHEET].index("referred_by")] = ref_code
+                    open_sheet(USERS_SHEET).update(f"A{idx}:{gspread.utils.rowcol_to_a1(idx, len(urow))}", [pad_row_to_header(urow, USERS_SHEET)])
+            except Exception:
+                logger.exception("Failed to store referral on start")
+
+            await message.answer("⚠️ برای استفاده از ربات باید در کانال(ها) زیر عضو شوید. پس از عضویت روی «✅ بررسی عضویت» بزنید:", reply_markup=kb, disable_web_page_preview=True)
             return
 
-        # membership OK: ensure user row and check email
+        # membership OK -> ensure Users row exists
         idx, urow = ensure_user_row_and_return(message.from_user)
-        # if referral code present and user has no referred_by yet -> set it
+
+        # if referral code present and not yet set, set it
         if ref_code:
             try:
                 if not urow[HEADERS[USERS_SHEET].index("referred_by")]:
                     urow[HEADERS[USERS_SHEET].index("referred_by")] = ref_code
-                    open_sheet(USERS_SHEET).update(f"A{idx}:K{idx}", [pad_row_to_header(urow, USERS_SHEET)])
+                    open_sheet(USERS_SHEET).update(f"A{idx}:{gspread.utils.rowcol_to_a1(idx, len(urow))}", [pad_row_to_header(urow, USERS_SHEET)])
             except Exception:
-                pass
+                logger.exception("Failed to set referred_by in start")
 
-        # check subscription active: if expired -> tell them to buy
+        # check subscription active
         if not has_active_subscription(message.from_user.id):
-            await message.answer("⚠️ اشتراک شما فعال نیست یا منقضی شده است. برای ادامه لطفا اشتراک بخرید.")
+            await message.answer("⚠️ اشتراک شما فعال نیست یا منقضی شده است. برای ادامه لطفا اشتراک تهیه کنید.")
             return
 
-        # email required: if empty, ask for it
+        # require email if empty
         try:
             email_col = HEADERS[USERS_SHEET].index("email")
             if not urow[email_col]:
@@ -633,11 +631,21 @@ async def cb_check_membership(callback_query: types.CallbackQuery):
 async def handle_email(message: types.Message):
     email = message.text.strip()
     try:
-        # basic format check
-        if len(email) < 5 or " " in email:
-            await message.answer("ایمیل وارد شده معتبر نیست.")
+        # basic validation
+        if len(email) < 5 or " " in email or "@" not in email:
+            await message.answer("ایمیل وارد شده معتبر نیست. دوباره امتحان کنید.")
             return
-        row_idx, _ = ensure_user_row_and_return(message.from_user, email=email)
+        # ensure user row and update email column
+        idx, urow = ensure_user_row_and_return(message.from_user)
+        try:
+            while len(urow) < len(HEADERS[USERS_SHEET]):
+                urow.append("")
+            urow[HEADERS[USERS_SHEET].index("email")] = email
+            open_sheet(USERS_SHEET).update(f"A{idx}:{gspread.utils.rowcol_to_a1(idx, len(urow))}", [pad_row_to_header(urow, USERS_SHEET)])
+        except Exception:
+            logger.exception("Failed to write email to sheet")
+            await message.answer("خطا در ذخیره ایمیل. لطفا بعدا تلاش کنید.")
+            return
         kb = build_main_keyboard()
         await message.answer("✅ ایمیل ثبت شد! لطفاً از منوی زیر انتخاب کنید:", reply_markup=kb)
     except Exception as e:
@@ -686,7 +694,6 @@ async def test_channel(message: types.Message):
         return
 
     await message.answer("⏳ لینک عضویت موقت برای شما ایجاد شد (۱۰ دقیقه):\n" + invite, disable_web_page_preview=True)
-    # write purchase/trial row and get its index
     joined_at = now_iso()
     row = [str(message.from_user.id), message.from_user.full_name or "", "", "trial", "0", "test_invite", "trial", joined_at, "", "", joined_at, ""]
     row_idx = await sheets_append_return_index(PURCHASES_SHEET, pad_row_to_header(row, PURCHASES_SHEET))
@@ -694,27 +701,30 @@ async def test_channel(message: types.Message):
         logger.error("Failed to append purchase row for trial user %s", message.from_user.id)
         await message.answer("⚠️ ثبت داخلی تست با خطا مواجه شد.")
         return
-    # schedule removal (DEV short delay default provided)
     await schedule_remove_after(TEST_CHANNEL_ID, message.from_user.id, delay_seconds=20, purchase_row_idx=row_idx)
 
 @dp.message_handler(lambda msg: msg.text == "خرید کانال معمولی")
 async def buy_normal(message: types.Message):
-    ensure_user_row_and_return(message.from_user)
+    idx, _ = ensure_user_row_and_return(message.from_user)
     created_at = now_iso()
-    row = [str(message.from_user.id), message.from_user.full_name or "", message.from_user.email if hasattr(message.from_user, 'email') else "", "normal", "", "", "awaiting_tx", created_at, "", "", ""]
-    row = pad_row_to_header(row, PURCHASES_SHEET)
-    idx = await sheets_append_return_index(PURCHASES_SHEET, row)
-    await message.answer(f"💳 لطفاً مبلغ مربوطه را واریز و اطلاعات تراکنش را ارسال کنید.\nشناسه سفارش داخلی: {idx}\n(کد تراکنش را به صورت متن ارسال کنید)")
-    
+    row = [str(message.from_user.id), message.from_user.full_name or "", "", "normal", "", "", "awaiting_tx", created_at, "", "", ""]
+    row_idx = await sheets_append_return_index(PURCHASES_SHEET, pad_row_to_header(row, PURCHASES_SHEET))
+    if row_idx <= 0:
+        await message.answer("⚠️ خطا در ثبت سفارش. لطفاً بعداً تلاش کنید.")
+        return
+    await message.answer(f"💳 سفارش ثبت شد. شناسه سفارش داخلی: {row_idx}\nلطفاً پس از پرداخت، شناسه یا اطلاعات تراکنش را همین‌جا ارسال کنید.")
+
 @dp.message_handler(lambda msg: msg.text == "خرید کانال ویژه")
 async def buy_premium(message: types.Message):
-    ensure_user_row_and_return(message.from_user)
+    idx, _ = ensure_user_row_and_return(message.from_user)
     created_at = now_iso()
-    row = [str(message.from_user.id), message.from_user.full_name or "", message.from_user.email if hasattr(message.from_user, 'email') else "", "premium", "", "", "awaiting_tx", created_at, "", "", ""]
-    row = pad_row_to_header(row, PURCHASES_SHEET)
-    idx = await sheets_append_return_index(PURCHASES_SHEET, row)
-    await message.answer(f"💳 لطفاً مبلغ مربوطه را واریز و اطلاعات تراکنش را ارسال کنید.\nشناسه سفارش داخلی: {idx}\n(کد تراکنش را به صورت متن ارسال کنید)")
-
+    row = [str(message.from_user.id), message.from_user.full_name or "", "", "premium", "", "", "awaiting_tx", created_at, "", "", ""]
+    row_idx = await sheets_append_return_index(PURCHASES_SHEET, pad_row_to_header(row, PURCHASES_SHEET))
+    if row_idx <= 0:
+        await message.answer("⚠️ خطا در ثبت سفارش. لطفاً بعداً تلاش کنید.")
+        return
+    await message.answer(f"💳 سفارش ویژه ثبت شد. شناسه سفارش داخلی: {row_idx}\nلطفاً پس از پرداخت، شناسه یا اطلاعات تراکنش را همین‌جا ارسال کنید.")
+    
 # catch-all text handler: either transaction info or support ticket
 # -------------------------
 # 7) catch_all_text (کامل قابل کپی/پیست)
@@ -744,7 +754,6 @@ async def catch_all_text(message: types.Message):
 
             if pending_idx:
                 row = rows[pending_idx - 1]
-                # ensure length
                 while len(row) < len(HEADERS[PURCHASES_SHEET]):
                     row.append("")
                 row[HEADERS[PURCHASES_SHEET].index("transaction_info")] = text
@@ -752,7 +761,6 @@ async def catch_all_text(message: types.Message):
                 row[HEADERS[PURCHASES_SHEET].index("request_at")] = created_at
                 await sheets_update_row(PURCHASES_SHEET, pending_idx, pad_row_to_header(row, PURCHASES_SHEET))
             else:
-                # fallback: append new pending row
                 new_row = [str(message.from_user.id), message.from_user.full_name or "", "", "unknown", "", text, "pending", created_at, "", "", ""]
                 await sheets_append(PURCHASES_SHEET, pad_row_to_header(new_row, PURCHASES_SHEET))
 
@@ -900,7 +908,6 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
             await callback_query.answer("ردیف موجود نیست یا قبلا تغییر کرده.", show_alert=True)
             return
         row = rows[purchase_row_idx - 1]
-        # ensure row length
         expected_len = len(HEADERS.get(PURCHASES_SHEET, []))
         while len(row) < expected_len:
             row.append("")
@@ -916,8 +923,6 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
         trans_info_idx = idx_of("transaction_info", 5)
         activated_idx = idx_of("activated_at", 8)
         expires_idx = idx_of("expires_at", 9)
-        joined_idx = idx_of("joined_at", 10)
-        left_idx = idx_of("left_at", 11)
         admin_note_idx = idx_of("admin_note", 12)
 
         if action == "confirm":
@@ -931,18 +936,17 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
 
             row[activated_idx] = activated
             row[expires_idx] = expires
-            row[admin_note_idx] = now_iso()  # mark handled
+            row[admin_note_idx] = now_iso()
             await sheets_update_row(PURCHASES_SHEET, purchase_row_idx, pad_row_to_header(row, PURCHASES_SHEET))
 
-            # determine plan and append subscription row
             plan = "premium" if ("premium" in (row[3] or "").lower()) else "normal"
-            sub_row = [str(target_user_id), plan, activated, expires, "yes"]
             try:
+                sub_row = [str(target_user_id), plan, activated, expires, "yes"]
                 await sheets_append(SUBS_SHEET, pad_row_to_header(sub_row, SUBS_SHEET))
             except Exception:
                 logger.exception("Failed to append subscription row")
 
-            # update Users sheet purchase_status and expires_at
+            # update Users sheet purchase_status/expires and ensure referral code exists
             try:
                 u_w = open_sheet(USERS_SHEET)
                 u_vals = u_w.get_all_values()
@@ -955,18 +959,14 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
                             ur[HEADERS[USERS_SHEET].index("expires_at")] = expires
                         except Exception:
                             pass
-                        # ensure referral code exists
-                        try:
-                            if not ur[HEADERS[USERS_SHEET].index("referral_code")]:
-                                ur[HEADERS[USERS_SHEET].index("referral_code")] = generate_referral_code()
-                        except Exception:
-                            pass
-                        u_w.update(f"A{i}:K{i}", [pad_row_to_header(ur, USERS_SHEET)])
+                        if not ur[HEADERS[USERS_SHEET].index("referral_code")]:
+                            ur[HEADERS[USERS_SHEET].index("referral_code")] = generate_referral_code()
+                        u_w.update(f"A{i}:{gspread.utils.rowcol_to_a1(i, len(ur))}", [pad_row_to_header(ur, USERS_SHEET)])
                         break
             except Exception:
                 logger.exception("Failed to update Users after confirm.")
 
-            # referral detection from transaction_info (if any)
+            # referral detection from transaction_info
             try:
                 trans_info = row[trans_info_idx] if trans_info_idx >= 0 else ""
                 if trans_info:
@@ -980,7 +980,7 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
                                 increment_referral_count(ref_found)
                             except Exception:
                                 logger.exception("increment_referral_count failed")
-                            # set referred_by in Users
+                            # write referred_by in Users
                             try:
                                 u_w = open_sheet(USERS_SHEET)
                                 u_vals = u_w.get_all_values()
@@ -989,7 +989,7 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
                                         while len(ur) < len(HEADERS[USERS_SHEET]):
                                             ur.append("")
                                         ur[HEADERS[USERS_SHEET].index("referred_by")] = str(ref_found)
-                                        u_w.update(f"A{j}:K{j}", [pad_row_to_header(ur, USERS_SHEET)])
+                                        u_w.update(f"A{j}:{gspread.utils.rowcol_to_a1(j, len(ur))}", [pad_row_to_header(ur, USERS_SHEET)])
                                         break
                             except Exception:
                                 logger.exception("Failed to set referred_by for user %s", target_user_id)
@@ -997,7 +997,7 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
             except Exception:
                 logger.exception("Referral detection failed for purchase row %s", purchase_row_idx)
 
-            # DM user and send invite links (handle invite errors)
+            # DM user and create invite(s) — record admin_note if invite fails
             try:
                 referral = ""
                 try:
@@ -1011,49 +1011,38 @@ async def process_admin_confirmation(callback_query: types.CallbackQuery):
 
                 await bot.send_message(target_user_id, "🎉 پرداخت شما تایید شد. اشتراک شما فعال شد.\nکد معرفی شما: " + (referral or generate_referral_code()))
 
-                # create invite(s)
                 if plan == "premium":
-                    for ch in [NORMAL_CHANNEL_ID, PREMIUM_CHANNEL_ID]:
-                        if ch:
-                            try:
-                                link = await create_temporary_invite(ch, expire_seconds=60*60*24, member_limit=1)
-                            except Exception as e:
-                                link = None
-                                logger.exception("create_temporary_invite failed: %s", e)
-                            if link:
-                                await bot.send_message(target_user_id, f"لینک عضویت در کانال: {link}")
-                            else:
-                                # record admin_note error
-                                try:
-                                    row[admin_note_idx] = f"invite_error:{ch}:{now_iso()}"
-                                    await sheets_update_row(PURCHASES_SHEET, purchase_row_idx, pad_row_to_header(row, PURCHASES_SHEET))
-                                except Exception:
-                                    logger.exception("Failed to write admin_note for invite error")
+                    chat_list = [NORMAL_CHANNEL_ID, PREMIUM_CHANNEL_ID]
                 else:
-                    if NORMAL_CHANNEL_ID:
+                    chat_list = [NORMAL_CHANNEL_ID]
+
+                for ch in chat_list:
+                    if not ch:
+                        continue
+                    try:
+                        link = await create_temporary_invite(ch, expire_seconds=60*60*24, member_limit=1)
+                    except Exception as e:
+                        link = None
+                        logger.exception("create_temporary_invite failed: %s", e)
+                    if link:
+                        await bot.send_message(target_user_id, f"لینک عضویت در کانال: {link}")
+                    else:
                         try:
-                            link = await create_temporary_invite(NORMAL_CHANNEL_ID, expire_seconds=60*60*24, member_limit=1)
+                            row[admin_note_idx] = (row[admin_note_idx] or "") + f" invite_error:{ch}:{now_iso()}"
+                            await sheets_update_row(PURCHASES_SHEET, purchase_row_idx, pad_row_to_header(row, PURCHASES_SHEET))
                         except Exception:
-                            link = None
-                        if link:
-                            await bot.send_message(target_user_id, f"لینک عضویت در کانال معمولی: {link}")
-                        else:
-                            try:
-                                row[admin_note_idx] = f"invite_error:{NORMAL_CHANNEL_ID}:{now_iso()}"
-                                await sheets_update_row(PURCHASES_SHEET, purchase_row_idx, pad_row_to_header(row, PURCHASES_SHEET))
-                            except Exception:
-                                logger.exception("Failed to write admin_note for invite error")
+                            logger.exception("Failed to write admin_note for invite error")
             except Exception:
                 logger.exception("Failed to DM user on confirm.")
 
             await callback_query.answer("خرید تأیید شد.")
         else:
-            # reject flow
+            # reject
             row[status_idx] = "rejected"
             row[admin_note_idx] = now_iso()
             await sheets_update_row(PURCHASES_SHEET, purchase_row_idx, pad_row_to_header(row, PURCHASES_SHEET))
             try:
-                await bot.send_message(target_user_id, "❌ خرید شما تایید نشد. لطفاً با پشتیبانی تماس بگیرید یا اطلاعات تراکنش را بررسی کنید.")
+                await bot.send_message(target_user_id, "❌ خرید شما تایید نشد. لطفاً با پشتیبانی تماس بگیرید.")
             except Exception:
                 logger.exception("Could not notify user about rejected payment.")
             await callback_query.answer("خرید رد شد.")
@@ -1259,7 +1248,6 @@ def run_polling_with_retries(skip_updates: bool = True, max_retries: int = 20):
             break
         except TerminatedByOtherGetUpdates as e:
             logger.error("TerminatedByOtherGetUpdates: %s", e)
-            # notify admin (best-effort) and then exit
             if ADMIN_TELEGRAM_ID:
                 try:
                     loop = asyncio.get_event_loop()
@@ -1267,7 +1255,6 @@ def run_polling_with_retries(skip_updates: bool = True, max_retries: int = 20):
                         "⚠️ خطای اجرا: یک instance دیگر این بات با همان توکن در حال اجرا است. لطفاً تنها یک instance فعال داشته باشید یا توکن را تغییر دهید."))
                 except Exception:
                     logger.exception("Could not notify admin about TerminatedByOtherGetUpdates.")
-            # exit with non-zero code so hosting platform knows failure
             import sys
             sys.exit(1)
         except Exception as e:
@@ -1285,6 +1272,7 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
 
