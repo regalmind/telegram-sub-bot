@@ -789,6 +789,13 @@ async def enforce_required_channels(user_id: int) -> Tuple[bool, List[str]]:
 
 
 # --- Updated /start handler with single-click membership check ---
+@dp.message_handler(commands=["ping"])
+async def handler_ping(message: types.Message):
+    try:
+        await message.reply("pong")
+    except Exception:
+        logger.exception("ping handler failed")
+
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     try:
@@ -1659,6 +1666,7 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
 
