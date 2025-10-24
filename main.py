@@ -239,57 +239,140 @@ def fix_sheet_header(ws_name: str, force_clear: bool = False) -> bool:
         logger.exception("fix_sheet_header failed for %s", ws_name)
         return False
 
-# convenience wrappers
-async def sheets_append(ws_name: str, row: List[Any]) -> bool:
-    row = pad_row_to_header(row, ws_name)
+# -------------------------
+# Convenience wrappers (async defs kept for compatibility with rest of code)
+# -------------------------
+async def sheets_get_all(ws_name: str) -> list:
+    """
+    Return all values from worksheet. Handles APIError 429 with retries/backoff.
+    """
     try:
         w = open_sheet(ws_name)
-        w.append_row(row, value_input_option="USER_ENTERED")
-        return True
-    except Exception:
-        logger.exception("sheets_append failed for sheet %s", ws_name)
-        return False
-
-async def sheets_append_return_index(ws_name: str, row: List[Any]) -> int:
-    row = pad_row_to_header(row, ws_name)
-    try:
-        w = open_sheet(ws_name)
-        w.append_row(row, value_input_option="USER_ENTERED")
-        vals = w.get_all_values()
-        return len(vals)
-    except Exception:
-        logger.exception("sheets_append_return_index failed for sheet %s", ws_name)
-        return -1
-
-async def sheets_get_all(ws_name: str) -> List[List[str]]:
-    try:
-        w = open_sheet(ws_name)
+        # perform read once
         vals = w.get_all_values()
         return vals
+    except APIError as e:
+        txt = str(e)
+        if "429" in txt or "Quota exceeded" in txt or "rateLimitExceeded" in txt:
+            logger.warning("sheets_get_all hit quota for %s; will backoff and retry", ws_name)
+            # small exponential backoff loop
+            wait = 1.0
+            for i in range(5):
+                time.sleep(wait + random.random() * 0.5)
+                try:
+                    w = open_sheet(ws_name)
+                    vals = w.get_all_values()
+                    return vals
+                except APIError as e2:
+                    txt2 = str(e2)
+                    if "429" in txt2 or "Quota exceeded" in txt2:
+                        wait = min(wait * 2, 60)
+                        continue
+                    else:
+                        logger.exception("sheets_get_all non-retryable APIError: %s", e2)
+                        break
+            logger.error("sheets_get_all retries exhausted for %s", ws_name)
+            return []
+        else:
+            logger.exception("sheets_get_all failed for %s", ws_name)
+            return []
     except Exception:
         logger.exception("sheets_get_all failed for %s", ws_name)
         return []
 
-async def sheets_update_range(ws_name: str, start_row: int, start_col: int, values: List[List[Any]]) -> bool:
-    # gspread uses A1 notation; convert
+async def sheets_append(ws_name: str, row: list) -> bool:
+    """
+    Append a row (after padding) to worksheet. Returns True on success.
+    """
     try:
+        row = pad_row_to_header(row, ws_name)
         w = open_sheet(ws_name)
-        cell_range = gspread.utils.rowcol_to_a1(start_row, start_col) + ":" + gspread.utils.rowcol_to_a1(start_row + len(values) - 1, start_col + (len(values[0]) - 1))
-        # new API prefers named args; pass values and range_name explicitly
-        w.update(range_name=cell_range, values=values)
+        w.append_row(row, value_input_option="USER_ENTERED")
+        # invalidate cache for that worksheet to avoid stale metadata if necessary
+        try:
+            _WORKSHEET_CACHE.pop(ws_name, None)
+        except Exception:
+            pass
         return True
+    except APIError as e:
+        txt = str(e)
+        logger.exception("sheets_append APIError for %s: %s", ws_name, e)
+        # backoff retry simple attempt
+        if "429" in txt or "Quota exceeded" in txt or "rateLimitExceeded" in txt:
+            wait = 1.0
+            for i in range(5):
+                time.sleep(wait + random.random() * 0.5)
+                try:
+                    w = open_sheet(ws_name)
+                    w.append_row(row, value_input_option="USER_ENTERED")
+                    _WORKSHEET_CACHE.pop(ws_name, None)
+                    return True
+                except APIError as e2:
+                    txt2 = str(e2)
+                    if "429" in txt2 or "Quota exceeded" in txt2:
+                        wait = min(wait * 2, 60)
+                        continue
+                    else:
+                        logger.exception("sheets_append non-retryable APIError: %s", e2)
+                        break
+        return False
     except Exception:
-        logger.exception("sheets_update_range failed for %s", ws_name)
+        logger.exception("sheets_append failed for %s", ws_name)
         return False
 
-async def sheets_update_row(ws_name: str, row_idx: int, values: List[Any]) -> bool:
+async def sheets_append_return_index(ws_name: str, row: list) -> int:
+    """
+    Append row and return 1-based appended row index, or -1 on failure.
+    Uses get_all_values after append (careful with quota).
+    """
     try:
-        w = open_sheet(ws_name)
-        # pad to header length for stable updates
+        ok = await sheets_append(ws_name, row)
+        if not ok:
+            return -1
+        # after append, fetch values to compute last index
+        vals = await sheets_get_all(ws_name)
+        return len(vals)
+    except Exception:
+        logger.exception("sheets_append_return_index failed for %s", ws_name)
+        return -1
+
+async def sheets_update_row(ws_name: str, row_idx: int, values: list) -> bool:
+    """
+    Update an entire row (A{row_idx}:...) with given values (list).
+    """
+    try:
         values = pad_row_to_header(values, ws_name)
+        w = open_sheet(ws_name)
         cell_range = f"A{row_idx}:{gspread.utils.rowcol_to_a1(row_idx, len(values))}"
         w.update(range_name=cell_range, values=[values])
+        # optionally invalidate cache
+        try:
+            _WORKSHEET_CACHE.pop(ws_name, None)
+        except Exception:
+            pass
         return True
+    except APIError as e:
+        txt = str(e)
+        logger.exception("sheets_update_row APIError for %s row %s: %s", ws_name, row_idx, e)
+        if "429" in txt or "Quota exceeded" in txt or "rateLimitExceeded" in txt:
+            wait = 1.0
+            for i in range(5):
+                time.sleep(wait + random.random() * 0.5)
+                try:
+                    w = open_sheet(ws_name)
+                    cell_range = f"A{row_idx}:{gspread.utils.rowcol_to_a1(row_idx, len(values))}"
+                    w.update(range_name=cell_range, values=[values])
+                    _WORKSHEET_CACHE.pop(ws_name, None)
+                    return True
+                except APIError as e2:
+                    txt2 = str(e2)
+                    if "429" in txt2 or "Quota exceeded" in txt2:
+                        wait = min(wait * 2, 60)
+                        continue
+                    else:
+                        logger.exception("sheets_update_row non-retryable APIError: %s", e2)
+                        break
+        return False
     except Exception:
         logger.exception("sheets_update_row failed for %s row %s", ws_name, row_idx)
         return False
@@ -315,6 +398,122 @@ def parse_iso_or_none(s: str) -> Optional[datetime]:
         return datetime.fromisoformat(s)
     except Exception:
         return None
+
+# -------------------------
+# Helpers for robust Google Sheets access (کامل)
+# پیست کن در بخش helpers بعد از HEADERS و قبل از استفاده از open_sheet/sheets_*
+# -------------------------
+import time
+import random
+from gspread.exceptions import APIError
+
+# caches to reduce repeated open_by_key calls
+_SPREADSHEET_CACHE = None         # holds gspread.Spreadsheet
+_WORKSHEET_CACHE: dict = {}       # ws_name -> gspread.Worksheet
+_open_by_key_last = {"key": None, "ts": 0.0}
+
+def pad_row_to_header(row: list, ws_name: str) -> list:
+    """Ensure row length == len(HEADERS[ws_name]) by padding with empty strings."""
+    header = HEADERS.get(ws_name, [])
+    desired = len(header)
+    row = list(row) if row is not None else []
+    while len(row) < desired:
+        row.append("")
+    # if row longer than header, keep as-is but avoid very long writes
+    return row[:max(desired, len(row))]
+
+def open_sheet_with_backoff(spreadsheet_key: str, max_retries: int = 6, base_wait: float = 1.0):
+    """
+    Try to open spreadsheet with exponential backoff on APIError (429 / quota).
+    Returns gspread.Spreadsheet on success or raises last exception.
+    NOTE: synchronous and may sleep (consistent with prior code style).
+    """
+    global _SPREADSHEET_CACHE, _open_by_key_last
+    # quick cache: if same key recently opened, reuse cached object
+    try:
+        if _SPREADSHEET_CACHE and _open_by_key_last.get("key") == spreadsheet_key:
+            return _SPREADSHEET_CACHE
+    except Exception:
+        pass
+
+    attempt = 0
+    wait = base_wait
+    while attempt < max_retries:
+        attempt += 1
+        try:
+            sh = gc.open_by_key(spreadsheet_key)
+            _SPREADSHEET_CACHE = sh
+            _open_by_key_last["key"] = spreadsheet_key
+            _open_by_key_last["ts"] = time.time()
+            return sh
+        except APIError as e:
+            txt = str(e)
+            # if quota exceeded / rate limit -> backoff and retry
+            if "429" in txt or "Quota exceeded" in txt or "rateLimitExceeded" in txt or "userRateLimitExceeded" in txt:
+                logger.warning("open_sheet_with_backoff attempt %s due to quota/rate-limit. sleeping %.1fs", attempt, wait)
+                time.sleep(wait + random.random() * 0.5)
+                wait = min(wait * 2, 60)
+                continue
+            # for other API errors re-raise
+            logger.exception("open_sheet_with_backoff non-retryable APIError: %s", e)
+            raise
+        except Exception as e:
+            logger.exception("open_sheet_with_backoff unexpected error: %s", e)
+            time.sleep(wait)
+            wait = min(wait * 2, 60)
+    raise RuntimeError("open_sheet_with_backoff failed after retries")
+
+def open_sheet(ws_name: str):
+    """
+    Robust open worksheet: uses open_sheet_with_backoff and caches Worksheet objects.
+    Ensures worksheet exists and header row present (but DOES NOT modify data).
+    """
+    global _WORKSHEET_CACHE
+    try:
+        # if cached and seems recent, try to reuse (avoid repeated metadata calls)
+        if ws_name in _WORKSHEET_CACHE:
+            try:
+                # quick lightweight call to check it still exists: fetch title
+                _ = _WORKSHEET_CACHE[ws_name].title
+                return _WORKSHEET_CACHE[ws_name]
+            except Exception:
+                # cache invalid -> drop and reopen
+                _WORKSHEET_CACHE.pop(ws_name, None)
+
+        sh = open_sheet_with_backoff(SPREADSHEET_ID)
+        # try to get worksheet, create if not exists
+        try:
+            w = sh.worksheet(ws_name)
+        except gspread.WorksheetNotFound:
+            logger.info("Worksheet %s not found. Creating.", ws_name)
+            w = sh.add_worksheet(title=ws_name, rows="1000", cols="20")
+        # ensure header exists (non-destructive): if first row empty, write header
+        try:
+            vals = w.get_all_values()
+            if not vals or (len(vals) == 0) or (not vals[0] or vals[0] == [] or str(vals[0][0]).strip() == ""):
+                header = HEADERS.get(ws_name, [])
+                if header:
+                    # insert header at row 1 (push existing data down)
+                    try:
+                        w.insert_row(header, index=1)
+                        logger.info("Inserted header for %s", ws_name)
+                    except Exception:
+                        # fallback: try update A1: to avoid destructive clear
+                        try:
+                            w.update("A1:1", [header])
+                            logger.info("Updated header for %s via update", ws_name)
+                        except Exception:
+                            logger.exception("Failed to set header for %s", ws_name)
+        except APIError as e:
+            # likely rate-limit; raise to caller to handle or backoff accordingly
+            logger.exception("open_sheet: APIError when checking header for %s: %s", ws_name, e)
+            raise
+        # cache and return
+        _WORKSHEET_CACHE[ws_name] = w
+        return w
+    except Exception:
+        logger.exception("Failed to open spreadsheet: %s", ws_name)
+        raise
 
 def has_active_subscription(user_id: int) -> bool:
     try:
@@ -954,15 +1153,13 @@ async def notify_admin_pending(pending_row: List[str]):
 async def poll_pending_notify_admin():
     """
     Poll Purchases sheet for pending purchases and notify admin with inline confirm/reject.
-    Uses HEADERS to compute indices so it adapts to your Purchases sheet layout.
-    Sleep set to 20s for quicker testing; بازنشانی به 12 یا مقدار دلخواه بعداً.
+    Reduced read frequency and protected against Sheets API quota errors.
     """
     await asyncio.sleep(2)
     while True:
         try:
             rows = await sheets_get_all(PURCHASES_SHEET)
             header = HEADERS.get(PURCHASES_SHEET, [])
-            # helper to get index by column name, fallback to default
             def hidx(name, default):
                 try:
                     return header.index(name)
@@ -980,7 +1177,7 @@ async def poll_pending_notify_admin():
                         status = (row[status_i] if len(row) > status_i else "").lower()
                         admin_note = (row[admin_note_i] if len(row) > admin_note_i else "")
                         if status == "pending" and not admin_note:
-                            if not ADMIN_TELEGRAM_ID:
+                            if not (ADMINS or ADMIN_TELEGRAM_ID):
                                 break
                             user_id = 0
                             try:
@@ -995,21 +1192,30 @@ async def poll_pending_notify_admin():
                                 f"Time: {row[request_i] if len(row)>request_i else ''}"
                             )
                             try:
-                                await bot.send_message(int(ADMIN_TELEGRAM_ID), msg, reply_markup=admin_confirm_keyboard(idx, user_id))
+                                target_admin = None
+                                # prefer sending to all admins
+                                if ADMINS:
+                                    await notify_admins(msg, reply_markup=admin_confirm_keyboard(idx, user_id))
+                                else:
+                                    await bot.send_message(int(ADMIN_TELEGRAM_ID), msg, reply_markup=admin_confirm_keyboard(idx, user_id))
                                 # mark admin_note column (avoid re-notify)
                                 while len(row) <= admin_note_i:
                                     row.append("")
                                 row[admin_note_i] = now_iso()
-                                await sheets_update_row(PURCHASES_SHEET, idx, row)
+                                await sheets_update_row(PURCHASES_SHEET, idx, pad_row_to_header(row, PURCHASES_SHEET))
+                            except APIError as e:
+                                logger.exception("Failed to notify admin about pending row %s due to APIError: %s", idx, e)
+                                # if sheets update failed due to quota, skip and let backoff in sheets_update_row handle it
                             except Exception:
                                 logger.exception("Failed to notify admin about pending row %s", idx)
                     except Exception:
                         logger.exception("Error processing purchase row %s", idx)
-            # delay between polling rounds — set to 20s for testing
-            await asyncio.sleep(20)
+            # delay between polling rounds — increased to reduce Sheets reads
+            await asyncio.sleep(60)
         except Exception as e:
             logger.exception("poll_pending_notify_admin loop error: %s", e)
-            await asyncio.sleep(20)
+            # on unexpected errors, back off a bit
+            await asyncio.sleep(60)
 
 # Callback handler for confirm/reject
 # -------------------------
@@ -1453,6 +1659,7 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
 
