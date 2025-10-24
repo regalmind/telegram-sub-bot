@@ -55,9 +55,9 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_ENV = os.getenv("GOOGLE_CREDENTIALS")
 GOOGLE_SERVICE_ACCOUNT_FILE = os.getenv("GOOGLE_SERVICE_ACCOUNT", "service-account.json")
 PORT = int(os.getenv("PORT", "8000"))
-NORMAL_CHANNEL_ID = os.getenv("NORMAL_CHANNEL_ID")
-PREMIUM_CHANNEL_ID = os.getenv("PREMIUM_CHANNEL_ID")
-TEST_CHANNEL_ID = os.getenv("TEST_CHANNEL_ID")
+NORMAL_CHANNEL_ID = os.getenv("CHANNEL_NORMAL_ID")
+PREMIUM_CHANNEL_ID = os.getenv("CHANNEL_PREMIUM_CHANNEL_ID")
+TEST_CHANNEL_ID = os.getenv("CHANNEL_TEST_CHANNEL_ID")
 REQUIRED_CHANNELS = os.getenv("REQUIRED_CHANNELS", "")  # comma separated
 INSTANCE_MODE = os.getenv("INSTANCE_MODE", "polling").lower()  # polling or webhook
 
@@ -643,7 +643,10 @@ async def cmd_start(message: types.Message):
 
         # check subscription active
         if not has_active_subscription(message.from_user.id):
-            await message.answer("⚠️ اشتراک شما فعال نیست یا منقضی شده است. برای ادامه لطفا اشتراک تهیه کنید.")
+            # show buy options inline (so user can immediately اقدام کند) and keep messages tidy
+            kb_buy = types.ReplyKeyboardMarkup(resize_keyboard=True)
+            kb_buy.row("خرید کانال معمولی", "خرید کانال ویژه")
+            await send_and_record(message.from_user.id, "⚠️ اشتراک شما فعال نیست یا منقضی شده است. برای ادامه لطفاً اشتراک تهیه کنید:", reply_markup=kb_buy)
             return
 
         # require email if empty
@@ -665,48 +668,56 @@ async def cmd_start(message: types.Message):
 # --- Callback handler for single-click membership check ---
 @dp.callback_query_handler(lambda c: c.data == "check_membership")
 async def cb_check_membership(callback_query: types.CallbackQuery):
-    """
-    When user clicks '✅ بررسی عضویت', re-check required channels and either show menu or tell which channels still missing.
-    """
     user = callback_query.from_user
     try:
         ok_membership, missing = await enforce_required_channels(user.id)
         if ok_membership:
-            # mark user row and show main menu
             ensure_user_row_and_return(user)
             kb = build_main_keyboard()
+            # edit the original message (where button was) to confirmation text and remove old inline keyboard
             try:
-                await callback_query.answer("عضویت تأیید شد.", show_alert=False)
+                await callback_query.message.edit_text("✅ عضویت شما در کانال(ها) تأیید شد. منوی اصلی برایتان ارسال شد.")
+            except Exception:
+                # fallback: answer callback and send DM
+                try:
+                    await callback_query.answer("عضویت تأیید شد.", show_alert=False)
+                except Exception:
+                    pass
+            # send main menu as DM and record (so previous bot messages cleaned)
+            try:
+                await send_and_record(user.id, "✅ عضویت شما در کانال(ها) تأیید شد. منوی اصلی:", reply_markup=kb)
             except Exception:
                 pass
-            try:
-                await bot.send_message(user.id, "✅ عضویت شما در کانال(ها) تأیید شد. منوی اصلی:", reply_markup=kb)
-            except Exception:
-                logger.exception("Could not send main menu DM to user %s", user.id)
         else:
-            # still missing some channels
-            text_lines = ["⚠️ هنوز به کانال(های) زیر ملحق نشده‌اید. لطفاً ابتدا عضو شوید و سپس دوباره بررسی کنید:"]
+            # build inline keyboard with URLs (editable in the same message)
+            kb2 = types.InlineKeyboardMarkup(row_width=1)
             for ch in missing:
                 if isinstance(ch, str) and ch.startswith("@"):
-                    text_lines.append(f"• {ch} — https://t.me/{ch.lstrip('@')}")
+                    kb2.add(types.InlineKeyboardButton(text=ch, url=f"https://t.me/{ch.lstrip('@')}"))
                 else:
-                    text_lines.append(f"• {ch}")
-            text_lines.append("\nپس از عضویت روی دکمه «🔁 بررسی مجدد» بزنید.")
-            text = "\n".join(text_lines)
-            # prepare inline keyboard to re-check
-            kb2 = types.InlineKeyboardMarkup()
+                    kb2.add(types.InlineKeyboardButton(text=str(ch), url=f"https://t.me/{str(ch).lstrip('-100')}"))
             kb2.add(types.InlineKeyboardButton("🔁 بررسی مجدد", callback_data="check_membership"))
             try:
-                await callback_query.answer("عضویت بررسی شد.", show_alert=False)
+                # edit original message to update text + keyboard (prevents stacking messages)
+                await callback_query.message.edit_text(
+                    "⚠️ هنوز به کانال(های) زیر ملحق نشده‌اید. لطفاً ابتدا عضو شوید و سپس دوباره بررسی کنید:",
+                    reply_markup=kb2,
+                    disable_web_page_preview=True
+                )
             except Exception:
-                pass
-            await bot.send_message(user.id, text, reply_markup=kb2, disable_web_page_preview=True)
+                # fallback: answer and send DM
+                try:
+                    await callback_query.answer("عضویت بررسی شد.", show_alert=False)
+                    await send_and_record(user.id, "⚠️ هنوز عضو نشده‌اید. لطفا کانال‌ها را چک کنید.", reply_markup=kb2)
+                except Exception:
+                    pass
     except Exception as e:
         logger.exception("Error in cb_check_membership: %s", e)
         try:
             await callback_query.answer("خطا در بررسی عضویت. لطفا دوباره تلاش کنید.", show_alert=True)
         except Exception:
             pass
+            
 @dp.message_handler(lambda msg: msg.text is not None and "@" in msg.text and "." in msg.text)
 async def handle_email(message: types.Message):
     email = message.text.strip()
@@ -1294,7 +1305,7 @@ async def admin_reply_ticket(message: types.Message):
 # -------------------------
 @dp.message_handler(commands=["reset_sheet"])
 async def reset_sheet_handler(message: types.Message):
-    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != str(ADMIN_TELEGRAM_ID):
+    if not is_admin(message.from_user.id):
         await message.reply("فقط ادمین می‌تواند از این دستور استفاده کند.")
         return
     parts = (message.text or "").split()
@@ -1338,28 +1349,43 @@ async def start_webserver():
     logger.info("Health server started on port %s", PORT)
 
 async def on_startup(dp_obj):
-    # debug envs (add inside on_startup)
-    try:
-        logger.info("ENV CHECK: TEST_CHANNEL_ID=%s NORMAL_CHANNEL_ID=%s PREMIUM_CHANNEL_ID=%s", TEST_CHANNEL_ID, NORMAL_CHANNEL_ID, PREMIUM_CHANNEL_ID)
-    except Exception:
-        pass
     try:
         if INSTANCE_MODE == "polling":
             await bot.delete_webhook(drop_pending_updates=True)
             logger.info("Webhook deleted on startup (polling mode).")
     except Exception:
         logger.exception("Failed to delete webhook on startup.")
+
     try:
+        # start simple health webserver
         asyncio.create_task(start_webserver())
     except Exception:
         logger.exception("Failed to start webserver.")
-    # ensure sheets exist BEFORE starting pollers
+
+    # Debug: log key envs for troubleshooting
+    try:
+        logger.info("ENV CHECK: TEST_CHANNEL_ID=%s NORMAL_CHANNEL_ID=%s PREMIUM_CHANNEL_ID=%s SPREADSHEET_ID=%s",
+                    TEST_CHANNEL_ID, NORMAL_CHANNEL_ID, PREMIUM_CHANNEL_ID, SPREADSHEET_ID)
+    except Exception:
+        pass
+
+    # Ensure sheet headers exist (non-destructive). This helps avoid append_row writing into wrong columns.
+    for sname in [USERS_SHEET, PURCHASES_SHEET, REFERRALS_SHEET, SUPPORT_SHEET, SUBS_SHEET, CONFIG_SHEET]:
+        try:
+            ok = fix_sheet_header(sname, force_clear=False)
+            if not ok:
+                logger.warning("fix_sheet_header reported problem for %s", sname)
+        except Exception:
+            logger.exception("fix_sheet_header exception for %s", sname)
+
+    # Ensure worksheets exist (open/create) AFTER header fixes
     for sname in [USERS_SHEET, PURCHASES_SHEET, REFERRALS_SHEET, SUPPORT_SHEET, SUBS_SHEET, CONFIG_SHEET]:
         try:
             open_sheet(sname)
         except Exception:
             logger.exception("Failed to ensure sheet exists: %s", sname)
-    # start background tasks AFTER sheets ensured
+
+    # Start background tasks AFTER sheets ensured
     try:
         asyncio.create_task(poll_pending_notify_admin())
         asyncio.create_task(rebuild_schedules_from_subscriptions())
@@ -1405,6 +1431,7 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
 
