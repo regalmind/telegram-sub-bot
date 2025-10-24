@@ -834,6 +834,23 @@ async def buy_premium(message: types.Message):
 # -------------------------
 @dp.message_handler(content_types=types.ContentTypes.TEXT)
 async def catch_all_text(message: types.Message):
+    # --- جلوگیری از پردازش فرمان‌ها ---
+    try:
+        # اگر پیام به صورت /command یا شامل entity نوع BOT_COMMAND است -> نادیده بگیر (تا command handlers کار کنند)
+        if message.text and message.text.startswith("/"):
+            return
+        ents = getattr(message, "entities", None)
+        if ents:
+            for e in ents:
+                try:
+                    if getattr(e, "type", "") == "bot_command":
+                        return
+                except Exception:
+                    continue
+    except Exception:
+        # در صورت خطا در تشخیص entity، ادامه بده (ایمن‌ترین حالت: اجازه نده به تیکت برود)
+        pass
+
     text = (message.text or "").strip()
     if not text:
         return
@@ -881,7 +898,12 @@ async def catch_all_text(message: types.Message):
         ok = await sheets_append(SUPPORT_SHEET, pad_row_to_header(ticket_row, SUPPORT_SHEET))
         if ok:
             await message.answer("✅ تیکت شما ثبت شد. پاسخ از طریق همین ربات ارسال خواهد شد.")
-            if ADMIN_TELEGRAM_ID:
+            if ADMINS:  # ارسال به همه ادمین‌ها (اگر ADMINS تعریف شده)
+                try:
+                    await notify_admins(f"🎫 تیکت جدید: {ticket_id}\nUser: {message.from_user.id}\nMessage: {text}")
+                except Exception:
+                    logger.exception("Could not notify admins of support ticket.")
+            elif ADMIN_TELEGRAM_ID:
                 try:
                     await bot.send_message(int(ADMIN_TELEGRAM_ID), f"🎫 تیکت جدید: {ticket_id}\nUser: {message.from_user.id}\nMessage: {text}")
                 except Exception:
@@ -1431,6 +1453,7 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
 
