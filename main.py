@@ -192,6 +192,53 @@ def open_sheet(ws_name: str):
         logger.exception("Failed to open/create worksheet %s: %s", ws_name, e)
         raise
 
+# -------------------------
+# fix_sheet_header: فقط header را در A1 بازنویسی می‌کند (در صورت نیاز) — قرار بعد از open_sheet
+# -------------------------
+def fix_sheet_header(ws_name: str, force_clear: bool = False) -> bool:
+    """
+    Ensure the first row of worksheet ws_name exactly matches HEADERS[ws_name].
+    If force_clear=True the sheet will be cleared before writing header (IRREVERSIBLE).
+    Returns True on success.
+    """
+    try:
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        try:
+            w = sh.worksheet(ws_name)
+        except gspread.WorksheetNotFound:
+            w = sh.add_worksheet(title=ws_name, rows="1000", cols="20")
+        header = HEADERS.get(ws_name, [])
+        if force_clear:
+            w.clear()
+            w.insert_row(header, index=1)
+            logger.info("Force-cleared and wrote header for %s", ws_name)
+            return True
+        # read first row
+        vals = w.get_all_values()
+        first = vals[0] if vals and len(vals) > 0 else []
+        # decide if header is OK: first cell should be telegram_id (as canonical)
+        if not first or (len(first) == 0) or (str(first[0]).strip() == "") or (str(first[0]).strip().lower() != header[0].lower()):
+            # attempt non-destructive fix: insert header at row 1 pushing data down
+            try:
+                w.insert_row(header, index=1)
+                logger.info("Inserted header row for %s (non-destructive).", ws_name)
+                return True
+            except Exception:
+                # fallback: clear and write header
+                try:
+                    w.clear()
+                    w.insert_row(header, index=1)
+                    logger.info("Cleared and wrote header for %s as fallback.", ws_name)
+                    return True
+                except Exception:
+                    logger.exception("Could not repair header for %s", ws_name)
+                    return False
+        # header OK
+        return True
+    except Exception:
+        logger.exception("fix_sheet_header failed for %s", ws_name)
+        return False
+
 # convenience wrappers
 async def sheets_append(ws_name: str, row: List[Any]) -> bool:
     row = pad_row_to_header(row, ws_name)
@@ -380,6 +427,39 @@ def increment_referral_count(referrer_id: str):
 # -------------------------
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
+
+# -------------------------
+# send_and_record: قبل از ارسال پیام قبلی ربات را حذف می‌کند (برای کاهش شلوغی)
+# نگهداری فقط در حافظه (در ریستارت پاک می‌شود) — قرار بده بعد از bot, dp
+# -------------------------
+_last_bot_messages: Dict[int, int] = {}  # user_id -> message_id
+
+async def send_and_record(user_id: int, text: str, **kwargs):
+    """
+    Deletes previous bot message to the user (if any) then sends a new one and records message_id.
+    kwargs passed to bot.send_message.
+    """
+    try:
+        prev = _last_bot_messages.get(user_id)
+        if prev:
+            try:
+                await bot.delete_message(chat_id=user_id, message_id=prev)
+            except Exception:
+                # ignore deletion errors
+                pass
+        msg = await bot.send_message(user_id, text, **kwargs)
+        try:
+            _last_bot_messages[user_id] = msg.message_id
+        except Exception:
+            pass
+        return msg
+    except Exception as e:
+        logger.exception("send_and_record failed for %s: %s", user_id, e)
+        # fallback: try plain send
+        try:
+            return await bot.send_message(user_id, text, **kwargs)
+        except Exception:
+            return None
 
 # -------------------------
 # Invite and trial management
@@ -681,25 +761,37 @@ async def support(message: types.Message):
 async def test_channel(message: types.Message):
     ensure_user_row_and_return(message.from_user)
     if not TEST_CHANNEL_ID:
-        await message.answer("⚠️ کانال تست تنظیم نشده است. با ادمین تماس بگیرید.")
+        await message.answer("⚠️ کانال تست تنظیم نشده است. مقدار env TEST_CHANNEL_ID را چک کن.")
         return
-    invite = None
+    # validate chat id via get_chat
+    try:
+        chat = await bot.get_chat(TEST_CHANNEL_ID)
+    except Exception as e:
+        logger.exception("get_chat(TEST_CHANNEL_ID) failed: %s", e)
+        await message.answer("⚠️ خطا در دسترسی به کانال تست. مطمئن شو ربات ادمین آن کانال است و شناسه درست است.")
+        return
+
+    # create invite
     try:
         invite = await create_temporary_invite(TEST_CHANNEL_ID, expire_seconds=600, member_limit=1)
     except Exception as e:
         logger.exception("create_temporary_invite error for test channel: %s", e)
+        invite = None
 
     if not invite:
-        await message.answer("⚠️ لینک دعوت ایجاد نشد. مطمئن شوید ربات ادمین کانال تست است.")
+        await message.answer("⚠️ لینک دعوت ایجاد نشد. مطمئن شوید ربات ادمین کانال تست است و دسترسی can_invite_users دارد.")
         return
 
-    await message.answer("⏳ لینک عضویت موقت برای شما ایجاد شد (۱۰ دقیقه):\n" + invite, disable_web_page_preview=True)
+    # clean previous bot messages to user
+    await send_and_record(message.from_user.id, "⏳ لینک عضویت موقت برای شما ایجاد شد (۱۰ دقیقه):\n" + invite, disable_web_page_preview=True)
+
+    # write purchase/trial row and get index
     joined_at = now_iso()
     row = [str(message.from_user.id), message.from_user.full_name or "", "", "trial", "0", "test_invite", "trial", joined_at, "", "", joined_at, ""]
     row_idx = await sheets_append_return_index(PURCHASES_SHEET, pad_row_to_header(row, PURCHASES_SHEET))
     if row_idx <= 0:
         logger.error("Failed to append purchase row for trial user %s", message.from_user.id)
-        await message.answer("⚠️ ثبت داخلی تست با خطا مواجه شد.")
+        await send_and_record(message.from_user.id, "⚠️ ثبت داخلی تست با خطا مواجه شد.")
         return
     await schedule_remove_after(TEST_CHANNEL_ID, message.from_user.id, delay_seconds=20, purchase_row_idx=row_idx)
 
@@ -1197,6 +1289,42 @@ async def admin_reply_ticket(message: types.Message):
         logger.exception("admin_reply_ticket error")
         await message.answer("خطا در ارسال پاسخ.")
 
+# -------------------------
+# /reset_sheet <SheetName> CONFIRM — پاک کند و header را بازنویسی کند (فقط ادمین)
+# -------------------------
+@dp.message_handler(commands=["reset_sheet"])
+async def reset_sheet_handler(message: types.Message):
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != str(ADMIN_TELEGRAM_ID):
+        await message.reply("فقط ادمین می‌تواند از این دستور استفاده کند.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 3 or parts[2].strip().lower() != "confirm":
+        await message.reply("استفاده: /reset_sheet <SheetName> confirm\nمثال: /reset_sheet Users confirm\n(این عمل همه‌چیز را حذف می‌کند!)")
+        return
+    sheet = parts[1].strip()
+    if sheet not in HEADERS:
+        await message.reply("نام شیت معتبر نیست. لیست شیت‌ها: " + ", ".join(HEADERS.keys()))
+        return
+    ok = fix_sheet_header(sheet, force_clear=True)
+    if ok:
+        await message.reply(f"شیت {sheet} پاک و header بازنویسی شد.")
+    else:
+        await message.reply(f"خطا در ریست کردن شیت {sheet}. لاگ‌ها را بررسی کن.")
+
+# -------------------------
+# /ensure_headers — بررسی و به‌صورت non-destructive header را قرار می‌دهد
+# -------------------------
+@dp.message_handler(commands=["ensure_headers"])
+async def ensure_headers_handler(message: types.Message):
+    if not ADMIN_TELEGRAM_ID or str(message.from_user.id) != str(ADMIN_TELEGRAM_ID):
+        await message.reply("فقط ادمین مجاز است.")
+        return
+    results = []
+    for s in HEADERS.keys():
+        ok = fix_sheet_header(s, force_clear=False)
+        results.append(f"{s}: {'OK' if ok else 'FAILED'}")
+    await message.reply("نتیجه بررسی هدرها:\n" + "\n".join(results))
+
 # Webserver (health) & startup
 async def start_webserver():
     app = web.Application()
@@ -1210,6 +1338,11 @@ async def start_webserver():
     logger.info("Health server started on port %s", PORT)
 
 async def on_startup(dp_obj):
+    # debug envs (add inside on_startup)
+    try:
+        logger.info("ENV CHECK: TEST_CHANNEL_ID=%s NORMAL_CHANNEL_ID=%s PREMIUM_CHANNEL_ID=%s", TEST_CHANNEL_ID, NORMAL_CHANNEL_ID, PREMIUM_CHANNEL_ID)
+    except Exception:
+        pass
     try:
         if INSTANCE_MODE == "polling":
             await bot.delete_webhook(drop_pending_updates=True)
@@ -1272,6 +1405,7 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
 
