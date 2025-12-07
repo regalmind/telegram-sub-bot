@@ -396,33 +396,60 @@ def increment_referral_count(referrer_id: str):
 bot = Bot(token=TOKEN)
 dp = Dispatcher(bot)
 
-# utils: is_admin
+# --- قرار بده دقیقاً بعد از bot = Bot(token=TOKEN) و dp = Dispatcher(bot) ---
+# Admins / helper functions (ensure ADMIN_TELEGRAM_ID and optional ADMINS env handled)
+import os
+
+# parse optional ADMINS env (comma separated list of ids or @usernames)
+ADMINS_ENV = os.getenv("ADMINS", "")  # example: "123456789,987654321" or "@admin1,@admin2"
+ADMINS = []
+if ADMINS_ENV:
+    for a in ADMINS_ENV.split(","):
+        a = a.strip()
+        if not a:
+            continue
+        # keep as string (compare normalized)
+        ADMINS.append(a)
+
 def is_admin(user_id: int) -> bool:
-    if ADMINS:
-        return int(user_id) in ADMINS
-    if ADMIN_TELEGRAM_ID:
-        try:
-            return str(user_id) == str(ADMIN_TELEGRAM_ID)
-        except Exception:
-            pass
+    """
+    Return True if user is the configured ADMIN_TELEGRAM_ID or in ADMINS list.
+    ADMIN_TELEGRAM_ID must be set in env (numeric string) for full admin control.
+    """
+    try:
+        if ADMIN_TELEGRAM_ID and str(user_id) == str(ADMIN_TELEGRAM_ID):
+            return True
+    except Exception:
+        pass
+    # check ADMINS list (allow numeric or @username forms)
+    for adm in ADMINS:
+        if str(adm).lstrip("@") == str(user_id) or adm == str(user_id) or adm == f"@{user_id}":
+            return True
     return False
 
-async def notify_admins(text: str, reply_markup=None):
-    """Notify configured admins (ADMINS list first, fallback to ADMIN_TELEGRAM_ID)."""
+async def notify_admins(text: str, **kwargs):
+    """Send message to ADMIN_TELEGRAM_ID and optional ADMINS (best-effort)."""
+    # prefer sending to all ADMINS (if their ids numeric); otherwise to ADMIN_TELEGRAM_ID
+    sent = False
     try:
-        if ADMINS:
-            for aid in ADMINS:
-                try:
-                    await bot.send_message(int(aid), text, reply_markup=reply_markup)
-                except Exception:
-                    logger.exception("Failed to notify admin %s", aid)
-        elif ADMIN_TELEGRAM_ID:
+        for adm in ADMINS:
             try:
-                await bot.send_message(int(ADMIN_TELEGRAM_ID), text, reply_markup=reply_markup)
+                if adm:
+                    if str(adm).startswith("@"):
+                        # skip username sends (could send as url) — prefer numeric ids
+                        continue
+                    await bot.send_message(int(adm), text, **kwargs)
+                    sent = True
             except Exception:
-                logger.exception("Failed to notify single ADMIN_TELEGRAM_ID")
+                continue
     except Exception:
-        logger.exception("notify_admins failed")
+        pass
+    if not sent and ADMIN_TELEGRAM_ID:
+        try:
+            await bot.send_message(int(ADMIN_TELEGRAM_ID), text, **kwargs)
+        except Exception:
+            pass
+# --- end block ---
 
 # send_and_record: single last bot message per user (helps avoid stacking many messages)
 _last_bot_messages: Dict[int, int] = {}  # user_id -> message_id
@@ -588,6 +615,34 @@ def ensure_user_row_and_return(user: types.User, email: Optional[str] = None) ->
     w.append_row(pad_row_to_header(new_row, USERS_SHEET), value_input_option="USER_ENTERED")
     vals2 = w.get_all_values()
     return len(vals2), pad_row_to_header(vals2[-1], USERS_SHEET)
+
+# --- paste this BEFORE cmd_start handler ---
+def has_active_subscription(user_id: int) -> bool:
+    try:
+        w = open_sheet(SUBS_SHEET)
+        vals = w.get_all_values()
+        if not vals or len(vals) <= 1:
+            return False
+        now = datetime.now(tz=ZoneInfo("Asia/Tehran"))
+        for row in vals[1:]:
+            try:
+                if len(row) > 0 and str(row[0]) == str(user_id):
+                    active = row[4] if len(row) > 4 else (row[-1] if row else "")
+                    expires = row[3] if len(row) > 3 else ""
+                    if active and str(active).lower() in ("yes", "true", "1"):
+                        dt = parse_iso_or_none(expires)
+                        if dt:
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=ZoneInfo("Asia/Tehran"))
+                            return dt > now
+                        else:
+                            return True
+            except Exception:
+                continue
+    except Exception:
+        logger.exception("has_active_subscription failed")
+    return False
+# --- end block ---
 
 # -------------------------
 # Handlers: /start, membership check, email, platform_info, support, test, buy
@@ -1417,6 +1472,37 @@ async def admin_reply_ticket(message: types.Message):
         logger.exception("admin_reply_ticket error")
         await message.answer("خطا در ارسال پاسخ.")
 
+@dp.message_handler(commands=["wipe_all_sheets"])
+async def wipe_all_sheets_handler(message: types.Message):
+    """
+    Admin-only: CLEAR all data in all sheets and write headers fresh.
+    Usage: /wipe_all_sheets CONFIRM
+    WARNING: irreversibly deletes sheet contents.
+    """
+    if not is_admin(message.from_user.id):
+        await message.reply("فقط ادمین مجاز است.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or parts[1].strip().lower() != "confirm":
+        await message.reply("استفاده: /wipe_all_sheets confirm\n(این عمل همه‌چیز را پاک می‌کند!)")
+        return
+    try:
+        sh = gc.open_by_key(SPREADSHEET_ID)
+        for name, header in HEADERS.items():
+            try:
+                try:
+                    ws = sh.worksheet(name)
+                    ws.clear()
+                except gspread.WorksheetNotFound:
+                    ws = sh.add_worksheet(title=name, rows="1000", cols="20")
+                ws.insert_row(header, index=1)
+            except Exception as e:
+                logger.exception("Failed resetting sheet %s: %s", name, e)
+        await message.reply("✅ همه شیت‌ها پاک و header ها بازنویسی شدند.")
+    except Exception as e:
+        logger.exception("wipe_all_sheets failed: %s", e)
+        await message.reply("خطا در عملیات پاک‌سازی. لاگ‌ها را چک کن.")
+
 # -------------------------
 # /reset_sheet <SheetName> CONFIRM — پاک کند و header را بازنویسی کند (فقط ادمین)
 # -------------------------
@@ -1583,6 +1669,7 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
 
