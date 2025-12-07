@@ -720,48 +720,67 @@ async def cmd_start(message: types.Message):
         # user-friendly message
         await message.answer("خطا در شروع. خطا به ادمین گزارش شد. لطفاً بعداً تلاش کنید.")
 
+# جایگزین callback membership checker با لاگ قوی
 @dp.callback_query_handler(lambda c: c.data == "check_membership")
 async def cb_check_membership(callback_query: types.CallbackQuery):
     user = callback_query.from_user
     try:
         ok_membership, missing = await enforce_required_channels(user.id)
-        if ok_membership:
-            ensure_user_row_and_return(user)
-            kb = build_main_keyboard()
-            try:
-                await callback_query.message.edit_text("✅ عضویت شما در کانال(ها) تأیید شد. منوی اصلی برایتان ارسال شد.")
-            except Exception:
-                try:
-                    await callback_query.answer("عضویت تأیید شد.", show_alert=False)
-                except Exception:
-                    pass
-            try:
-                await send_and_record(user.id, "✅ عضویت شما در کانال(ها) تأیید شد. منوی اصلی:", reply_markup=kb)
-            except Exception:
-                pass
-        else:
-            kb2 = types.InlineKeyboardMarkup(row_width=1)
-            for ch in missing:
-                if isinstance(ch, str) and ch.startswith("@"):
-                    kb2.add(types.InlineKeyboardButton(text=f"عضویت در {ch}", url=f"https://t.me/{ch.lstrip('@')}"))
-                else:
-                    kb2.add(types.InlineKeyboardButton(text=str(ch), url=f"https://t.me/{str(ch).lstrip('-100')}"))
-            kb2.add(types.InlineKeyboardButton("🔁 بررسی مجدد", callback_data="check_membership"))
-            try:
-                await callback_query.message.edit_text("⚠️ هنوز به کانال(های) زیر ملحق نشده‌اید. لطفاً ابتدا عضو شوید و سپس دوباره بررسی کنید:", reply_markup=kb2, disable_web_page_preview=True)
-            except Exception:
-                try:
-                    await callback_query.answer("عضویت بررسی شد.", show_alert=False)
-                    await send_and_record(user.id, "⚠️ هنوز عضو نشده‌اید. لطفا کانال‌ها را چک کنید.", reply_markup=kb2)
-                except Exception:
-                    pass
-    except Exception as e:
-        logger.exception("Error in cb_check_membership: %s", e)
+    except Exception:
+        tb = traceback.format_exc()
+        logger.exception("Error while checking membership in cb_check_membership: %s", tb)
         try:
-            await callback_query.answer("خطا در بررسی عضویت. لطفا دوباره تلاش کنید.", show_alert=True)
+            if ADMIN_TELEGRAM_ID:
+                await bot.send_message(int(ADMIN_TELEGRAM_ID), f"Error in cb_check_membership for user {user.id}:\n{tb}")
+        except Exception:
+            logger.exception("Failed to notify admin about cb_check_membership error")
+        await callback_query.answer("خطا در بررسی عضویت. ادمین مطلع شد.", show_alert=True)
+        return
+
+    if ok_membership:
+        try:
+            ensure_user_row_and_return(user)
+        except Exception:
+            logger.exception("ensure_user_row_and_return failed in cb_check_membership")
+
+        kb = build_main_keyboard()
+        try:
+            # edit original message (clean UI)
+            await callback_query.message.edit_text("✅ عضویت شما در کانال(ها) تأیید شد. منوی اصلی برایتان ارسال شد.")
         except Exception:
             pass
-
+        try:
+            await send_and_record(user.id, "✅ عضویت شما تأیید شد. منوی اصلی:", reply_markup=kb)
+        except Exception:
+            logger.exception("Failed to send main menu after membership check")
+        try:
+            await callback_query.answer("عضویت تأیید شد.", show_alert=False)
+        except Exception:
+            pass
+    else:
+        kb2 = types.InlineKeyboardMarkup(row_width=1)
+        for ch in missing:
+            if isinstance(ch, str) and ch.startswith("@"):
+                kb2.add(types.InlineKeyboardButton(text=f"عضویت در {ch}", url=f"https://t.me/{ch.lstrip('@')}"))
+            else:
+                try:
+                    username_try = str(ch).lstrip("-100")
+                    kb2.add(types.InlineKeyboardButton(text=str(ch), url=f"https://t.me/{username_try}"))
+                except Exception:
+                    kb2.add(types.InlineKeyboardButton(text=str(ch), callback_data="noop"))
+        kb2.add(types.InlineKeyboardButton("🔁 بررسی مجدد", callback_data="check_membership"))
+        try:
+            await callback_query.message.edit_text("⚠️ هنوز عضو کانال(های) زیر نیستید. لطفاً ابتدا عضو شوید و سپس دوباره بررسی کنید:", reply_markup=kb2, disable_web_page_preview=True)
+        except Exception:
+            # fallback: DM
+            try:
+                await send_and_record(user.id, "⚠️ هنوز عضو نشده‌اید. لطفا کانال‌ها را بررسی کنید.", reply_markup=kb2)
+            except Exception:
+                logger.exception("Failed to notify user about missing channels")
+        try:
+            await callback_query.answer("عضویت بررسی شد.", show_alert=False)
+        except Exception:
+            pass
 @dp.message_handler(lambda msg: msg.text is not None and "@" in msg.text and "." in msg.text)
 async def handle_email(message: types.Message):
     email = message.text.strip()
@@ -1529,4 +1548,5 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
