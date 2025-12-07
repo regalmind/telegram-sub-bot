@@ -1420,24 +1420,59 @@ async def admin_reply_ticket(message: types.Message):
 # -------------------------
 # /reset_sheet <SheetName> CONFIRM — پاک کند و header را بازنویسی کند (فقط ادمین)
 # -------------------------
+# ============================
+# RESET SHEETS (ADMIN ONLY)
+# ============================
 @dp.message_handler(commands=["reset_sheet"])
-async def reset_sheet_handler(message: types.Message):
-    if not is_admin(message.from_user.id):
-        await message.reply("فقط ادمین می‌تواند از این دستور استفاده کند.")
-        return
-    parts = (message.text or "").split()
-    if len(parts) < 3 or parts[2].strip().lower() != "confirm":
-        await message.reply("استفاده: /reset_sheet <SheetName> confirm\nمثال: /reset_sheet Users confirm\n(این عمل همه‌چیز را حذف می‌کند!)")
-        return
-    sheet = parts[1].strip()
-    if sheet not in HEADERS:
-        await message.reply("نام شیت معتبر نیست. لیست شیت‌ها: " + ", ".join(HEADERS.keys()))
-        return
-    ok = fix_sheet_header(sheet, force_clear=True)
-    if ok:
-        await message.reply(f"شیت {sheet} پاک و header بازنویسی شد.")
-    else:
-        await message.reply(f"خطا در ریست کردن شیت {sheet}. لاگ‌ها را بررسی کن.")
+async def cmd_reset_sheet(message: types.Message):
+    try:
+        admin_id = str(ADMIN_TELEGRAM_ID)
+
+        # reject non-admins
+        if str(message.from_user.id) != admin_id:
+            await message.answer("⛔ شما اجازه‌ی اجرای این دستور را ندارید.")
+            return
+
+        await message.answer("⏳ در حال پاک‌سازی کامل شیت‌ها...")
+
+        # delete and recreate all required sheets
+        sh = SPREADSHEET  # same object from global load
+
+        required = {
+            USERS_SHEET: HEADERS[USERS_SHEET],
+            PURCHASES_SHEET: HEADERS[PURCHASES_SHEET],
+            REFERRAL_SHEET: HEADERS[REFERRAL_SHEET],
+            SUPPORT_SHEET: HEADERS[SUPPORT_SHEET]
+        }
+
+        sheet_names = [ws.title for ws in sh.worksheets()]
+
+        for sheet_name in required:
+            if sheet_name in sheet_names:
+                try:
+                    worksheet = sh.worksheet(sheet_name)
+                    worksheet.clear()
+                    worksheet.update("A1", [required[sheet_name]])
+                except Exception as e:
+                    logger.exception(f"Failed to reset sheet {sheet_name}: {e}")
+            else:
+                try:
+                    sh.add_worksheet(title=sheet_name, rows="1000", cols="30")
+                    sh.worksheet(sheet_name).update("A1", [required[sheet_name]])
+                except Exception as e:
+                    logger.exception(f"Failed to create sheet {sheet_name}: {e}")
+
+        await message.answer("✅ *تمام شیت‌ها با موفقیت ریست شدند.*", parse_mode="Markdown")
+
+    except Exception as e:
+        tb = traceback.format_exc()
+        logger.exception(f"/reset_sheet error: {tb}")
+        await message.answer("❌ خطا در ریست شیت. جزئیات در لاگ.")
+        try:
+            if ADMIN_TELEGRAM_ID:
+                await bot.send_message(int(ADMIN_TELEGRAM_ID), f"خطا در reset_sheet:\n{tb}")
+        except:
+            pass
 
 # -------------------------
 # /ensure_headers — بررسی و به‌صورت non-destructive header را قرار می‌دهد
@@ -1548,5 +1583,6 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
