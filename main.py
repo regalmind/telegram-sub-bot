@@ -592,68 +592,133 @@ def ensure_user_row_and_return(user: types.User, email: Optional[str] = None) ->
 # -------------------------
 # Handlers: /start, membership check, email, platform_info, support, test, buy
 # -------------------------
+# جایگزین /start handler با لاگ و گزارش بهتر
+import traceback
+
 @dp.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     try:
-        # parse optional referral code: /start REF
+        # parse possible referral: /start REF
         parts = (message.text or "").split()
         ref_code = parts[1].strip() if len(parts) > 1 else ""
 
-        ok_membership, missing = await enforce_required_channels(message.from_user.id)
-        # store user row early (so first-time users get created)
-        idx, urow = ensure_user_row_and_return(message.from_user)
-
-        # store referral if provided and not set
-        if ref_code:
+        # quick env sanity checks (fail early with user-friendly msgs)
+        missing_env = []
+        for name in ("SPREADSHEET_ID",):
+            if not globals().get(name) and not os.getenv(name):
+                missing_env.append(name)
+        if missing_env:
+            logger.error("Missing required env(s): %s", missing_env)
+            await message.answer("⚠️ پیکربندی ربات ناقص است. لطفاً ادمین را مطلع کنید.")
+            # notify admin with details if configured
             try:
-                if not urow[HEADERS[USERS_SHEET].index("referred_by")]:
-                    urow[HEADERS[USERS_SHEET].index("referred_by")] = ref_code
-                    open_sheet(USERS_SHEET).update(f"A{idx}:{gspread.utils.rowcol_to_a1(idx, len(urow))}", [pad_row_to_header(urow, USERS_SHEET)])
+                if ADMIN_TELEGRAM_ID:
+                    await bot.send_message(int(ADMIN_TELEGRAM_ID),
+                                           f"Missing envs for /start: {missing_env} (user {message.from_user.id})")
             except Exception:
-                logger.exception("Failed to set referred_by in start")
+                logger.exception("Failed to notify admin about missing envs")
+            return
+
+        # membership check (wrap to catch any unexpected sheet/bot errors)
+        try:
+            ok_membership, missing = await enforce_required_channels(message.from_user.id)
+        except Exception:
+            tb = traceback.format_exc()
+            logger.exception("enforce_required_channels failed in /start: %s", tb)
+            # inform admin
+            try:
+                if ADMIN_TELEGRAM_ID:
+                    await bot.send_message(int(ADMIN_TELEGRAM_ID), f"Error in enforce_required_channels (/start):\n{tb}")
+            except Exception:
+                logger.exception("Failed to notify admin about enforce_required_channels error")
+            await message.answer("خطا در بررسی عضویت. ادمین اطلاع داده شد. لطفاً بعدا تلاش کنید.")
+            return
 
         if not ok_membership:
-            # build inline keyboard with link buttons for username channels
+            # build inline keyboard with channel links and a check button
             kb = types.InlineKeyboardMarkup(row_width=1)
             for ch in missing:
                 if isinstance(ch, str) and ch.startswith("@"):
                     kb.add(types.InlineKeyboardButton(text=f"عضویت در {ch}", url=f"https://t.me/{ch.lstrip('@')}"))
                 else:
-                    # numeric id: present as text (user can copy)
-                    kb.add(types.InlineKeyboardButton(text=str(ch), url=f"https://t.me/{str(ch).lstrip('-100')}"))
+                    # numeric id or unknown -> show text + try t.me link
+                    try:
+                        username_try = str(ch).lstrip("-100")
+                        kb.add(types.InlineKeyboardButton(text=f"عضویت در {ch}", url=f"https://t.me/{username_try}"))
+                    except Exception:
+                        kb.add(types.InlineKeyboardButton(text=str(ch), callback_data="noop"))
             kb.add(types.InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_membership"))
             if ADMIN_TELEGRAM_ID:
                 try:
-                    kb.add(types.InlineKeyboardButton("👤 تماس با ادمین", url=f"https://t.me/{ADMIN_TELEGRAM_ID}" if str(ADMIN_TELEGRAM_ID).startswith("@") else f"https://t.me/{ADMIN_TELEGRAM_ID}"))
+                    kb.add(types.InlineKeyboardButton("👤 تماس با ادمین", url=f"https://t.me/{ADMIN_TELEGRAM_ID.lstrip('@')}" if isinstance(ADMIN_TELEGRAM_ID, str) else f"https://t.me/{ADMIN_TELEGRAM_ID}"))
                 except Exception:
                     pass
-            await message.answer("⚠️ برای استفاده از ربات باید در کانال(ها) زیر عضو شوید. پس از عضویت روی «✅ بررسی عضویت» بزنید:", reply_markup=kb, disable_web_page_preview=True)
+
+            await send_and_record(message.from_user.id,
+                                  "⚠️ برای استفاده از ربات باید در کانال(های) زیر عضو شوید. پس از عضویت روی «✅ بررسی عضویت» بزنید:",
+                                  reply_markup=kb, disable_web_page_preview=True)
+            # store referral if present (best-effort)
+            if ref_code:
+                try:
+                    idx, urow = ensure_user_row_and_return(message.from_user)
+                    while len(urow) < len(HEADERS[USERS_SHEET]):
+                        urow.append("")
+                    urow[HEADERS[USERS_SHEET].index("referred_by")] = ref_code
+                    open_sheet(USERS_SHEET).update(f"A{idx}:{gspread.utils.rowcol_to_a1(idx, len(urow))}", [pad_row_to_header(urow, USERS_SHEET)])
+                except Exception:
+                    logger.exception("Failed to write referral on start (non-fatal)")
             return
 
-        # membership OK -> require email if empty (first-time users)
+        # membership ok -> ensure user row
         try:
-            email_col = HEADERS[USERS_SHEET].index("email")
-            if not urow[email_col]:
-                await message.answer("لطفاً ایمیل خود را ارسال کنید (مثال: name@example.com). این مرحله برای ثبت اشتراک ضروری است.")
+            idx, urow = ensure_user_row_and_return(message.from_user)
+        except Exception:
+            tb = traceback.format_exc()
+            logger.exception("ensure_user_row_and_return failed: %s", tb)
+            try:
+                if ADMIN_TELEGRAM_ID:
+                    await bot.send_message(int(ADMIN_TELEGRAM_ID), f"Error ensure_user_row_and_return (/start):\n{tb}")
+            except Exception:
+                pass
+            await message.answer("خطا در ثبت داخلی اطلاعات. ادمین مطلع شد.")
+            return
+
+        # if user has no active subscription -> show buy buttons
+        try:
+            if not has_active_subscription(message.from_user.id):
+                kb_buy = types.ReplyKeyboardMarkup(resize_keyboard=True)
+                kb_buy.row("خرید کانال معمولی", "خرید کانال ویژه")
+                await send_and_record(message.from_user.id, "⚠️ اشتراک شما فعال نیست یا منقضی شده است. برای ادامه لطفاً اشتراک تهیه کنید:", reply_markup=kb_buy)
                 return
         except Exception:
-            pass
+            logger.exception("has_active_subscription failed; allowing user to continue as fallback")
 
-        # check subscription active
-        if not has_active_subscription(message.from_user.id):
-            kb_buy = types.ReplyKeyboardMarkup(resize_keyboard=True)
-            kb_buy.row("خرید کانال معمولی", "خرید کانال ویژه")
-            await send_and_record(message.from_user.id, "⚠️ اشتراک شما فعال نیست یا منقضی شده است. برای ادامه لطفاً اشتراک تهیه کنید:", reply_markup=kb_buy)
-            return
-
-        kb = build_main_keyboard()
-        await message.answer("👋 خوش آمدید! منوی اصلی:", reply_markup=kb)
-    except Exception as e:
-        logger.exception("Error in /start: %s", e)
+        # require email if empty (first-time user)
         try:
-            await message.answer("خطا در شروع. لطفا بعداً تلاش کنید.")
+            email_col = HEADERS[USERS_SHEET].index("email")
+            cur_email = ""
+            if len(urow) > email_col:
+                cur_email = urow[email_col]
+            if not cur_email:
+                await send_and_record(message.from_user.id, "لطفاً ایمیل خود را ارسال کنید (مثال: name@example.com)")
+                return
         except Exception:
-            pass
+            logger.exception("Email-check in /start failed (non-fatal)")
+
+        # all good -> main menu
+        kb = build_main_keyboard()
+        await send_and_record(message.from_user.id, "👋 خوش آمدید! منوی اصلی:", reply_markup=kb)
+    except Exception:
+        tb = traceback.format_exc()
+        logger.exception("Unhandled error in /start: %s", tb)
+        # notify admin with traceback for faster debugging
+        try:
+            if ADMIN_TELEGRAM_ID:
+                await bot.send_message(int(ADMIN_TELEGRAM_ID), f"Unhandled error in /start (user {message.from_user.id}):\n{tb}")
+        except Exception:
+            logger.exception("Failed to notify admin about unhandled /start exception")
+        # user-friendly message
+        await message.answer("خطا در شروع. خطا به ادمین گزارش شد. لطفاً بعداً تلاش کنید.")
 
 @dp.callback_query_handler(lambda c: c.data == "check_membership")
 async def cb_check_membership(callback_query: types.CallbackQuery):
@@ -1464,3 +1529,4 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
