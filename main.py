@@ -1560,6 +1560,12 @@ async def cmd_reset_sheet(message: types.Message):
         except:
             pass
 
+@dp.message_handler(commands=["ping"])
+async def cmd_ping(message: types.Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("pong")
+
 # -------------------------
 # /ensure_headers — بررسی و به‌صورت non-destructive header را قرار می‌دهد
 # -------------------------
@@ -1669,6 +1675,7 @@ if __name__ == "__main__":
     if INSTANCE_MODE == "webhook":
         logger.info("INSTANCE_MODE=webhook requested but not configured; falling back to polling.")
     run_polling_with_retries(skip_updates=True, max_retries=20)
+
 
 
 
