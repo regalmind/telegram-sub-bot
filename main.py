@@ -1113,8 +1113,8 @@ async def callback_payment_method(callback: types.CallbackQuery):
     
     await callback.answer()
 
-@dp.message_handler(content_types=types.ContentType.PHOTO,
-                   lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_card_receipt")
+@dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_card_receipt",
+                   content_types=types.ContentType.PHOTO)
 async def handle_card_receipt(message: types.Message):
     """Handle card receipt"""
     user = message.from_user
@@ -1959,4 +1959,5 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
