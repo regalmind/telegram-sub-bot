@@ -1,8 +1,5 @@
 services:
   - type: web
     name: telegram-subscription-bot
-    env: python
+    env: docker
     plan: free
-    pythonVersion: 3.11.8
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
