@@ -2006,8 +2006,10 @@ async def on_startup(dp):
             logger.error(f"❌ Sheet {sheet_name}: {e}")
     
     asyncio.create_task(rebuild_subscription_schedules())
+    asyncio.create_task(poll_sheets_auto_process())
     
     logger.info("✅ Bot started!")
+
 
 async def rebuild_subscription_schedules():
     """Rebuild subscription schedules"""
@@ -2092,6 +2094,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
