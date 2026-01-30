@@ -1202,8 +1202,10 @@ async def handle_usdt_txid(message: types.Message):
         f"✅ <b>TXID دریافت شد!</b>\n\n"
         f"🔢 <code>{purchase_id}</code>\n\n"
         f"⏳ در حال بررسی...",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard()
     )
+
 
     if ADMIN_TELEGRAM_ID:
         try:
@@ -1981,6 +1983,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
