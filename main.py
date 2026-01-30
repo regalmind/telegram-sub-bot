@@ -1051,36 +1051,43 @@ async def callback_payment_method(callback: types.CallbackQuery):
     user = callback.from_user
     
     if method == "card":
-        usdt_rate = await get_usdt_price_irr()
-        price_irr = price_usd * usdt_rate
-        purchase_id = generate_purchase_id()
-        
-        await append_row("Purchases", [
-            purchase_id, str(user.id), user.username or "", product,
-            str(price_usd), str(price_irr), "card", "", "pending",
-            now_iso(), "", "", ""
-        ])
-        
-        user_states[user.id] = {
-            "state": "awaiting_card_receipt",
-            "purchase_id": purchase_id,
-            "product": product,
-            "amount_usd": price_usd,
-            "amount_irr": price_irr
-        }
-        
-        await callback.message.edit_text(
-            f"💳 <b>پرداخت با کارت بانکی</b>\n\n"
-            f"📦 محصول: اشتراک {'معمولی' if product == 'normal' else 'ویژه'}\n"
-            f"💵 مبلغ: <b>${price_usd}</b> (≈ <b>{price_irr:,.0f}</b> تومان)\n\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"📋 <b>شماره کارت:</b>\n<code>{CARD_NUMBER}</code>\n\n"
-            f"👤 <b>به نام:</b> {CARD_HOLDER}\n"
-            f"━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"⚠️ پس از واریز، عکس رسید را ارسال کنید.\n\n"
-            f"🔢 شناسه: <code>{purchase_id}</code>",
-            parse_mode="HTML"
-        )
+    usdt_rate = await get_usdt_price_irr()
+    price_irr = price_usd * usdt_rate
+    purchase_id = generate_purchase_id()
+    
+    await append_row("Purchases", [
+        purchase_id, str(user.id), user.username or "", product,
+        str(price_usd), str(price_irr), "card", "", "pending",
+        now_iso(), "", "", ""
+    ])
+    
+    user_states[user.id] = {
+        "state": "awaiting_card_receipt",
+        "purchase_id": purchase_id,
+        "product": product,
+        "amount_usd": price_usd,
+        "amount_irr": price_irr
+    }
+    
+    support_username = os.getenv("SUPPORT_USERNAME", "@YourSupportAccount")
+    
+    await callback.message.edit_text(
+        f"💳 <b>پرداخت با کارت بانکی</b>\n\n"
+        f"📦 محصول: اشتراک {'معمولی' if product == 'normal' else 'ویژه'}\n"
+        f"💵 مبلغ: <b>{price_irr:,.0f}</b> تومان\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 <b>شماره کارت:</b>\n<code>{CARD_NUMBER}</code>\n\n"
+        f"👤 <b>به نام:</b> {CARD_HOLDER}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"⚠️ پس از واریز:\n"
+        f"۱. عکس رسید را بگیرید\n"
+        f"۲. به {support_username} ارسال کنید\n"
+        f"۳. همراه عکس این شناسه را بفرستید:\n"
+        f"<code>{purchase_id}</code>\n\n"
+        f"⏰ پس از تایید، اشتراک فعال می‌شود.",
+        parse_mode="HTML"
+    )
+
     
     elif method == "usdt":
         purchase_id = generate_purchase_id()
@@ -1198,7 +1205,7 @@ async def handle_usdt_txid(message: types.Message):
         f"⏳ در حال بررسی...",
         parse_mode="HTML"
     )
-    
+
     if ADMIN_TELEGRAM_ID:
         try:
             kb = admin_purchase_keyboard(purchase_id, user.id)
@@ -1621,10 +1628,23 @@ async def callback_admin_withdrawal(callback: types.CallbackQuery):
 async def handle_referral(message: types.Message):
     """Referral handler"""
     user = message.from_user
+    
+    # Check if user has active subscription
+    subscription = await get_active_subscription(user.id)
+    
+    if not subscription:
+        await message.reply(
+            "⚠️ <b>برای استفاده از سیستم معرفی، ابتدا باید اشتراک خریداری کنید.</b>\n\n"
+            "پس از خرید اشتراک، کد معرف شما فعال می‌شود.",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard()
+        )
+        return
+    
     result = await find_user(user.id)
     
     if not result:
-        await message.reply("❌ خطا در بارگذاری.")
+        await message.reply("❌ خطا در بارگذاری اطلاعات.", reply_markup=main_menu_keyboard())
         return
     
     _, row = result
@@ -1645,8 +1665,7 @@ async def handle_referral(message: types.Message):
     bot_username = (await bot.get_me()).username
     referral_link = f"https://t.me/{bot_username}?start={referral_code}"
     
-    await send_and_record(
-        user.id,
+    await message.reply(
         f"🎁 <b>دعوت دوستان</b>\n\n"
         f"🔗 <b>لینک:</b>\n<code>{referral_link}</code>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1660,8 +1679,10 @@ async def handle_referral(message: types.Message):
         f"• هر خرید = پورسانت\n"
         f"• سطح 1: 8%\n"
         f"• سطح 2: 12%",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard()
     )
+
 
 # ============================================
 # SUPPORT SYSTEM
@@ -1671,13 +1692,14 @@ async def handle_support(message: types.Message):
     """Support handler"""
     user_states[message.from_user.id] = {"state": "awaiting_support_message"}
     
-    await send_and_record(
-        message.from_user.id,
+    await message.reply(
         "💬 <b>پشتیبانی</b>\n\n"
         "پیام خود را ارسال کنید.\n"
         "به زودی پاسخ داده می‌شود.",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard()
     )
+
 
 @dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_support_message")
 async def handle_support_message(message: types.Message):
@@ -1718,8 +1740,7 @@ async def handle_support_message(message: types.Message):
 @dp.message_handler(lambda msg: msg.text == "📚 راهنما")
 async def handle_help(message: types.Message):
     """Help handler"""
-    await send_and_record(
-        message.from_user.id,
+    await message.reply(
         "📚 <b>راهنما</b>\n\n"
         "🆓 <b>تست کانال:</b>\n"
         "• ۵ دقیقه رایگان\n"
@@ -1737,8 +1758,10 @@ async def handle_help(message: types.Message):
         "💬 <b>پشتیبانی:</b>\n"
         "• ثبت تیکت\n"
         "• پاسخ سریع",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard()
     )
+
 
 # ============================================
 # ADMIN COMMANDS
@@ -1959,6 +1982,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
