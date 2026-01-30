@@ -1883,6 +1883,115 @@ async def callback_back_to_buy(callback: types.CallbackQuery):
     await callback.answer()
 
 # ============================================
+# AUTO-PROCESS PURCHASES & TICKETS
+# ============================================
+async def poll_sheets_auto_process():
+    """Check Purchases and Tickets sheets every 30 seconds"""
+    await asyncio.sleep(10)
+    
+    while True:
+        try:
+            # Process Purchases
+            rows = await get_all_rows("Purchases")
+            
+            for idx, row in enumerate(rows[1:], start=2):
+                if not row or len(row) < 9:
+                    continue
+                
+                purchase_id = row[0]
+                telegram_id = int(row[1]) if row[1] else 0
+                username = row[2] if len(row) > 2 else ""
+                product = row[3] if len(row) > 3 else ""
+                amount_usd = float(row[4]) if row[4] else 0
+                payment_method = row[6] if len(row) > 6 else ""
+                status = row[8] if len(row) > 8 else ""
+                approved_at = row[10] if len(row) > 10 else ""
+                notes = row[12] if len(row) > 12 else ""
+                
+                if status == "approved" and approved_at and "processed" not in notes:
+                    logger.info(f"Auto-approving {purchase_id}")
+                    
+                    await activate_subscription(telegram_id, username, product, payment_method)
+                    await process_referral_commission(purchase_id, telegram_id, amount_usd)
+                    
+                    try:
+                        result = await find_user(telegram_id)
+                        if result:
+                            _, user_row = result
+                            referral_code = user_row[4] if len(user_row) > 4 else ""
+                            
+                            await bot.send_message(
+                                telegram_id,
+                                f"🎉 <b>پرداخت تایید شد!</b>\n\n"
+                                f"✅ اشتراک فعال شد\n"
+                                f"📅 مدت: ۶ ماه\n\n"
+                                f"🎁 کد معرف:\n<code>{referral_code}</code>\n\n"
+                                f"💡 با دعوت دوستان پورسانت کسب کنید!",
+                                parse_mode="HTML",
+                                reply_markup=main_menu_keyboard()
+                            )
+                    except Exception as e:
+                        logger.exception(f"Failed to notify: {e}")
+                    
+                    row[12] = "auto_processed"
+                    await update_row("Purchases", idx, row)
+                
+                elif status == "rejected" and approved_at and "processed" not in notes:
+                    logger.info(f"Auto-rejecting {purchase_id}")
+                    
+                    try:
+                        await bot.send_message(
+                            telegram_id,
+                            "❌ <b>سفارش رد شد</b>\n\n"
+                            "با پشتیبانی تماس بگیرید.",
+                            parse_mode="HTML",
+                            reply_markup=main_menu_keyboard()
+                        )
+                    except:
+                        pass
+                    
+                    row[12] = "auto_processed"
+                    await update_row("Purchases", idx, row)
+            
+            # Process Tickets
+            ticket_rows = await get_all_rows("Tickets")
+            
+            for idx, row in enumerate(ticket_rows[1:], start=2):
+                if not row or len(row) < 9:
+                    continue
+                
+                ticket_id = row[0]
+                telegram_id = int(row[1]) if row[1] else 0
+                response = row[7] if len(row) > 7 else ""
+                responded_at = row[8] if len(row) > 8 else ""
+                status = row[5] if len(row) > 5 else ""
+                
+                if response and responded_at and status == "closed":
+                    # Check if already sent
+                    if "sent" not in response:
+                        try:
+                            await bot.send_message(
+                                telegram_id,
+                                f"📬 <b>پاسخ پشتیبانی</b>\n\n"
+                                f"🔢 <code>{ticket_id}</code>\n\n"
+                                f"💬 {response}",
+                                parse_mode="HTML",
+                                reply_markup=main_menu_keyboard()
+                            )
+                            
+                            row[7] = response + " [sent]"
+                            await update_row("Tickets", idx, row)
+                        except Exception as e:
+                            logger.exception(f"Failed to send ticket response: {e}")
+            
+            await asyncio.sleep(30)
+            
+        except Exception as e:
+            logger.exception(f"poll_sheets error: {e}")
+            await asyncio.sleep(60)
+
+
+# ============================================
 # STARTUP & MAIN
 # ============================================
 async def on_startup(dp):
@@ -1983,6 +2092,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
