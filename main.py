@@ -1089,10 +1089,6 @@ async def callback_payment_method(callback: types.CallbackQuery):
         )
     
     elif method == "usdt":
-
-
-    
-    elif method == "usdt":
         purchase_id = generate_purchase_id()
         
         await append_row("Purchases", [
@@ -1985,6 +1981,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
