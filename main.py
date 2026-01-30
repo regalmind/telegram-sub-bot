@@ -1051,42 +1051,45 @@ async def callback_payment_method(callback: types.CallbackQuery):
     user = callback.from_user
     
     if method == "card":
-    usdt_rate = await get_usdt_price_irr()
-    price_irr = price_usd * usdt_rate
-    purchase_id = generate_purchase_id()
+        usdt_rate = await get_usdt_price_irr()
+        price_irr = price_usd * usdt_rate
+        purchase_id = generate_purchase_id()
+        
+        await append_row("Purchases", [
+            purchase_id, str(user.id), user.username or "", product,
+            str(price_usd), str(price_irr), "card", "", "pending",
+            now_iso(), "", "", ""
+        ])
+        
+        user_states[user.id] = {
+            "state": "awaiting_card_receipt",
+            "purchase_id": purchase_id,
+            "product": product,
+            "amount_usd": price_usd,
+            "amount_irr": price_irr
+        }
+        
+        support_username = os.getenv("SUPPORT_USERNAME", "@YourSupportAccount")
+        
+        await callback.message.edit_text(
+            f"💳 <b>پرداخت با کارت بانکی</b>\n\n"
+            f"📦 محصول: اشتراک {'معمولی' if product == 'normal' else 'ویژه'}\n"
+            f"💵 مبلغ: <b>{price_irr:,.0f}</b> تومان\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📋 <b>شماره کارت:</b>\n<code>{CARD_NUMBER}</code>\n\n"
+            f"👤 <b>به نام:</b> {CARD_HOLDER}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"⚠️ پس از واریز:\n"
+            f"۱. عکس رسید را بگیرید\n"
+            f"۲. به {support_username} ارسال کنید\n"
+            f"۳. همراه عکس این شناسه را بفرستید:\n"
+            f"<code>{purchase_id}</code>\n\n"
+            f"⏰ پس از تایید، اشتراک فعال می‌شود.",
+            parse_mode="HTML"
+        )
     
-    await append_row("Purchases", [
-        purchase_id, str(user.id), user.username or "", product,
-        str(price_usd), str(price_irr), "card", "", "pending",
-        now_iso(), "", "", ""
-    ])
-    
-    user_states[user.id] = {
-        "state": "awaiting_card_receipt",
-        "purchase_id": purchase_id,
-        "product": product,
-        "amount_usd": price_usd,
-        "amount_irr": price_irr
-    }
-    
-    support_username = os.getenv("SUPPORT_USERNAME", "@YourSupportAccount")
-    
-    await callback.message.edit_text(
-        f"💳 <b>پرداخت با کارت بانکی</b>\n\n"
-        f"📦 محصول: اشتراک {'معمولی' if product == 'normal' else 'ویژه'}\n"
-        f"💵 مبلغ: <b>{price_irr:,.0f}</b> تومان\n\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📋 <b>شماره کارت:</b>\n<code>{CARD_NUMBER}</code>\n\n"
-        f"👤 <b>به نام:</b> {CARD_HOLDER}\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"⚠️ پس از واریز:\n"
-        f"۱. عکس رسید را بگیرید\n"
-        f"۲. به {support_username} ارسال کنید\n"
-        f"۳. همراه عکس این شناسه را بفرستید:\n"
-        f"<code>{purchase_id}</code>\n\n"
-        f"⏰ پس از تایید، اشتراک فعال می‌شود.",
-        parse_mode="HTML"
-    )
+    elif method == "usdt":
+
 
     
     elif method == "usdt":
@@ -1982,6 +1985,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
