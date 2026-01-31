@@ -123,7 +123,7 @@ SHEET_DEFINITIONS = {
     "Purchases": [
         "purchase_id", "telegram_id", "username", "product",
         "amount_usd", "amount_irr", "payment_method", 
-        "transaction_id", "status", "created_at", 
+        "transaction_id", "admin_action", "status", "created_at", 
         "approved_at", "approved_by", "notes"
     ],
     "Referrals": [
@@ -1887,89 +1887,164 @@ async def callback_back_to_buy(callback: types.CallbackQuery):
 # AUTO-PROCESS PURCHASES & TICKETS
 # ============================================
 async def poll_sheets_auto_process():
-    """Check Purchases and Tickets sheets every 30 seconds"""
+    """Check Purchases and Tickets every 30 seconds - Simple Admin Mode"""
     await asyncio.sleep(10)
+    logger.info("🔄 Polling started (Simple Admin Mode)")
     
     while True:
         try:
-            # Process Purchases
+            # ============ Process Purchases ============
             rows = await get_all_rows("Purchases")
             
+            if not rows or len(rows) <= 1:
+                await asyncio.sleep(30)
+                continue
+            
+            header = rows[0]
+            
+            # Find column indexes
+            try:
+                admin_action_idx = header.index("admin_action")
+                status_idx = header.index("status")
+                notes_idx = header.index("notes")
+                purchase_id_idx = header.index("purchase_id")
+                telegram_id_idx = header.index("telegram_id")
+                username_idx = header.index("username")
+                product_idx = header.index("product")
+                amount_usd_idx = header.index("amount_usd")
+                payment_method_idx = header.index("payment_method")
+                approved_at_idx = header.index("approved_at")
+                approved_by_idx = header.index("approved_by")
+            except ValueError as e:
+                logger.error(f"Missing column in Purchases: {e}")
+                await asyncio.sleep(30)
+                continue
+            
             for idx, row in enumerate(rows[1:], start=2):
-                if not row or len(row) < 9:
+                if not row or len(row) <= admin_action_idx:
                     continue
                 
-                purchase_id = row[0]
-                telegram_id = int(row[1]) if row[1] else 0
-                username = row[2] if len(row) > 2 else ""
-                product = row[3] if len(row) > 3 else ""
-                amount_usd = float(row[4]) if row[4] else 0
-                payment_method = row[6] if len(row) > 6 else ""
-                status = row[8] if len(row) > 8 else ""
-                approved_at = row[10] if len(row) > 10 else ""
-                notes = row[12] if len(row) > 12 else ""
-                
-                if status == "approved" and approved_at and "processed" not in notes:
-                    logger.info(f"Auto-approving {purchase_id}")
+                try:
+                    admin_action = row[admin_action_idx].strip().lower() if len(row) > admin_action_idx else ""
+                    status = row[status_idx].strip().lower() if len(row) > status_idx else ""
+                    notes = row[notes_idx].strip().lower() if len(row) > notes_idx else ""
                     
-                    await activate_subscription(telegram_id, username, product, payment_method)
-                    await process_referral_commission(purchase_id, telegram_id, amount_usd)
+                    # Skip if no action or already processed
+                    if not admin_action or "processed" in notes:
+                        continue
                     
-                    try:
-                        result = await find_user(telegram_id)
-                        if result:
-                            _, user_row = result
-                            referral_code = user_row[4] if len(user_row) > 4 else ""
-                            
+                    purchase_id = row[purchase_id_idx] if len(row) > purchase_id_idx else ""
+                    telegram_id = int(row[telegram_id_idx]) if len(row) > telegram_id_idx and row[telegram_id_idx] else 0
+                    username = row[username_idx] if len(row) > username_idx else ""
+                    product = row[product_idx] if len(row) > product_idx else ""
+                    amount_usd = float(row[amount_usd_idx]) if len(row) > amount_usd_idx and row[amount_usd_idx] else 0
+                    payment_method = row[payment_method_idx] if len(row) > payment_method_idx else ""
+                    
+                    if not telegram_id:
+                        continue
+                    
+                    # Process APPROVE
+                    if admin_action == "approve":
+                        logger.info(f"✅ Auto-approving {purchase_id} for user {telegram_id}")
+                        
+                        try:
+                            await activate_subscription(telegram_id, username, product, payment_method)
+                            await process_referral_commission(purchase_id, telegram_id, amount_usd)
+                        except Exception as e:
+                            logger.exception(f"Failed to activate: {e}")
+                        
+                        try:
+                            result = await find_user(telegram_id)
+                            if result:
+                                _, user_row = result
+                                referral_code = user_row[4] if len(user_row) > 4 else ""
+                                
+                                await bot.send_message(
+                                    telegram_id,
+                                    f"🎉 <b>پرداخت تایید شد!</b>\n\n"
+                                    f"✅ اشتراک فعال شد\n"
+                                    f"📅 مدت: ۶ ماه\n\n"
+                                    f"🎁 کد معرف:\n<code>{referral_code}</code>\n\n"
+                                    f"💡 با دعوت دوستان پورسانت کسب کنید!",
+                                    parse_mode="HTML",
+                                    reply_markup=main_menu_keyboard()
+                                )
+                                logger.info(f"✅ Sent approval to {telegram_id}")
+                        except Exception as e:
+                            logger.exception(f"Failed to send approval: {e}")
+                        
+                        # Auto-fill columns
+                        row[admin_action_idx] = ""  # Clear action
+                        row[status_idx] = "approved"
+                        row[approved_at_idx] = now_iso()
+                        row[approved_by_idx] = "admin"
+                        row[notes_idx] = "auto_processed"
+                        await update_row("Purchases", idx, row)
+                    
+                    # Process REJECT
+                    elif admin_action == "reject":
+                        logger.info(f"❌ Auto-rejecting {purchase_id} for user {telegram_id}")
+                        
+                        try:
                             await bot.send_message(
                                 telegram_id,
-                                f"🎉 <b>پرداخت تایید شد!</b>\n\n"
-                                f"✅ اشتراک فعال شد\n"
-                                f"📅 مدت: ۶ ماه\n\n"
-                                f"🎁 کد معرف:\n<code>{referral_code}</code>\n\n"
-                                f"💡 با دعوت دوستان پورسانت کسب کنید!",
+                                "❌ <b>سفارش رد شد</b>\n\n"
+                                "با پشتیبانی تماس بگیرید.",
                                 parse_mode="HTML",
                                 reply_markup=main_menu_keyboard()
                             )
-                    except Exception as e:
-                        logger.exception(f"Failed to notify: {e}")
-                    
-                    row[12] = "auto_processed"
-                    await update_row("Purchases", idx, row)
+                            logger.info(f"✅ Sent rejection to {telegram_id}")
+                        except Exception as e:
+                            logger.exception(f"Failed to send rejection: {e}")
+                        
+                        # Auto-fill columns
+                        row[admin_action_idx] = ""  # Clear action
+                        row[status_idx] = "rejected"
+                        row[approved_at_idx] = now_iso()
+                        row[approved_by_idx] = "admin"
+                        row[notes_idx] = "auto_processed"
+                        await update_row("Purchases", idx, row)
                 
-                elif status == "rejected" and approved_at and "processed" not in notes:
-                    logger.info(f"Auto-rejecting {purchase_id}")
-                    
-                    try:
-                        await bot.send_message(
-                            telegram_id,
-                            "❌ <b>سفارش رد شد</b>\n\n"
-                            "با پشتیبانی تماس بگیرید.",
-                            parse_mode="HTML",
-                            reply_markup=main_menu_keyboard()
-                        )
-                    except:
-                        pass
-                    
-                    row[12] = "auto_processed"
-                    await update_row("Purchases", idx, row)
+                except Exception as e:
+                    logger.exception(f"Error processing purchase row {idx}: {e}")
             
-            # Process Tickets
+            # ============ Process Tickets ============
             ticket_rows = await get_all_rows("Tickets")
             
-            for idx, row in enumerate(ticket_rows[1:], start=2):
-                if not row or len(row) < 9:
+            if ticket_rows and len(ticket_rows) > 1:
+                ticket_header = ticket_rows[0]
+                
+                try:
+                    ticket_id_idx = ticket_header.index("ticket_id")
+                    ticket_telegram_id_idx = ticket_header.index("telegram_id")
+                    ticket_response_idx = ticket_header.index("response")
+                    ticket_responded_at_idx = ticket_header.index("responded_at")
+                    ticket_status_idx = ticket_header.index("status")
+                except ValueError as e:
+                    logger.error(f"Missing column in Tickets: {e}")
+                    await asyncio.sleep(30)
                     continue
                 
-                ticket_id = row[0]
-                telegram_id = int(row[1]) if row[1] else 0
-                response = row[7] if len(row) > 7 else ""
-                responded_at = row[8] if len(row) > 8 else ""
-                status = row[5] if len(row) > 5 else ""
-                
-                if response and responded_at and status == "closed":
-                    # Check if already sent
-                    if "sent" not in response:
+                for idx, row in enumerate(ticket_rows[1:], start=2):
+                    if not row or len(row) <= ticket_response_idx:
+                        continue
+                    
+                    try:
+                        ticket_id = row[ticket_id_idx] if len(row) > ticket_id_idx else ""
+                        telegram_id = int(row[ticket_telegram_id_idx]) if len(row) > ticket_telegram_id_idx and row[ticket_telegram_id_idx] else 0
+                        response = row[ticket_response_idx].strip() if len(row) > ticket_response_idx else ""
+                        responded_at = row[ticket_responded_at_idx].strip() if len(row) > ticket_responded_at_idx else ""
+                        
+                        if not telegram_id or not response:
+                            continue
+                        
+                        # Check if already sent
+                        if "[sent]" in response or responded_at:
+                            continue
+                        
+                        # Send response
+                        logger.info(f"📬 Sending ticket {ticket_id} to {telegram_id}")
+                        
                         try:
                             await bot.send_message(
                                 telegram_id,
@@ -1980,16 +2055,24 @@ async def poll_sheets_auto_process():
                                 reply_markup=main_menu_keyboard()
                             )
                             
-                            row[7] = response + " [sent]"
+                            # Auto-fill columns
+                            row[ticket_response_idx] = response + " [sent]"
+                            row[ticket_responded_at_idx] = now_iso()
+                            row[ticket_status_idx] = "closed"
                             await update_row("Tickets", idx, row)
+                            logger.info(f"✅ Sent ticket response to {telegram_id}")
                         except Exception as e:
-                            logger.exception(f"Failed to send ticket response: {e}")
+                            logger.exception(f"Failed to send ticket: {e}")
+                    
+                    except Exception as e:
+                        logger.exception(f"Error processing ticket row {idx}: {e}")
             
             await asyncio.sleep(30)
             
         except Exception as e:
-            logger.exception(f"poll_sheets error: {e}")
+            logger.exception(f"💥 poll_sheets error: {e}")
             await asyncio.sleep(60)
+
 
 
 # ============================================
@@ -2095,6 +2178,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
