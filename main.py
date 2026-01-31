@@ -304,7 +304,7 @@ def is_admin(user_id: int) -> bool:
 # NOBITEX API FOR IRR PRICE
 # ============================================
 async def get_usdt_price_irr() -> float:
-    """Get USDT price in IRR from Nobitex"""
+    """Get USDT price in IRR from Nobitex (accurate)"""
     try:
         async with ClientSession() as session:
             async with session.get("https://api.nobitex.ir/v2/orderbook/USDTIRT") as resp:
@@ -312,13 +312,17 @@ async def get_usdt_price_irr() -> float:
                     data = await resp.json()
                     asks = data.get("asks", [])
                     if asks and len(asks) > 0:
-                        price = float(asks[0][0])
-                        logger.info(f"💱 USDT: {price:,.0f} IRR")
-                        return price
+                        # قیمت به ریال هست، تبدیل به تومان
+                        price_rial = float(asks[0][0])
+                        price_toman = price_rial / 10
+                        logger.info(f"💱 USDT: {price_toman:,.0f} تومان")
+                        return price_toman
     except Exception as e:
-        logger.exception(f"Failed to get USDT price: {e}")
+        logger.exception(f"Nobitex API error: {e}")
     
-    return 68000.0
+    # Fallback: قیمت تقریبی فعلی
+    return 160000.0
+
 
 # ============================================
 # TELEGRAM HELPERS
@@ -1123,7 +1127,7 @@ async def callback_payment_method(callback: types.CallbackQuery):
 @dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_card_receipt",
                    content_types=types.ContentType.PHOTO)
 async def handle_card_receipt(message: types.Message):
-    """Handle card receipt"""
+    """Handle card receipt photo"""
     user = message.from_user
     state = user_states.get(user.id, {})
     purchase_id = state.get("purchase_id")
@@ -1135,41 +1139,51 @@ async def handle_card_receipt(message: types.Message):
         await message.reply("❌ خطا: سفارش یافت نشد.")
         return
     
+    # Save photo to purchases
     rows = await get_all_rows("Purchases")
+    purchase_idx = None
+    
     for idx, row in enumerate(rows[1:], start=2):
         if row and row[0] == purchase_id:
+            purchase_idx = idx
             row[7] = f"photo:{message.photo[-1].file_id}"
-            row[8] = "pending"
             await update_row("Purchases", idx, row)
             break
     
     user_states.pop(user.id, None)
     
     await message.reply(
-        f"✅ <b>رسید دریافت شد!</b>\n\n"
+        "✅ <b>رسید دریافت شد!</b>\n\n"
         f"🔢 شناسه: <code>{purchase_id}</code>\n\n"
-        f"⏳ در حال بررسی...",
-        parse_mode="HTML"
+        "⏳ در حال بررسی توسط پشتیبان...",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard()
     )
     
-    if ADMIN_TELEGRAM_ID:
+    # Send to support with inline buttons
+    if ADMIN_TELEGRAM_ID and purchase_idx:
         try:
-            kb = admin_purchase_keyboard(purchase_id, user.id)
+            kb = InlineKeyboardMarkup(row_width=2)
+            kb.add(
+                InlineKeyboardButton("✅ تایید", callback_data=f"approve_card_{purchase_id}_{user.id}_{purchase_idx}"),
+                InlineKeyboardButton("❌ رد", callback_data=f"reject_card_{purchase_id}_{user.id}_{purchase_idx}")
+            )
+            
             await bot.send_photo(
                 int(ADMIN_TELEGRAM_ID),
                 message.photo[-1].file_id,
-                caption=f"🔔 <b>سفارش جدید</b>\n\n"
-                        f"👤 {user.full_name}\n"
-                        f"🆔 <code>{user.id}</code>\n"
-                        f"📦 {product}\n"
-                        f"💰 ${amount_usd} (≈ {amount_irr:,.0f} تومان)\n"
-                        f"💳 کارت بانکی\n"
-                        f"🔢 <code>{purchase_id}</code>",
+                caption=f"💳 <b>رسید پرداخت جدید</b>\n\n"
+                        f"👤 <b>کاربر:</b> {user.full_name}\n"
+                        f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
+                        f"📦 <b>محصول:</b> {'معمولی' if product == 'normal' else 'ویژه'}\n"
+                        f"💰 <b>مبلغ:</b> ${amount_usd} (≈ {amount_irr:,.0f} تومان)\n\n"
+                        f"🔢 <b>شناسه:</b> <code>{purchase_id}</code>",
                 parse_mode="HTML",
                 reply_markup=kb
             )
         except Exception as e:
-            logger.exception(f"Admin notify failed: {e}")
+            logger.exception(f"Failed to notify admin: {e}")
+
 
 @dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_usdt_txid")
 async def handle_usdt_txid(message: types.Message):
@@ -1226,6 +1240,107 @@ async def handle_usdt_txid(message: types.Message):
             )
         except Exception as e:
             logger.exception(f"Admin notify failed: {e}")
+
+@dp.callback_query_handler(lambda c: c.data.startswith("approve_card_") or c.data.startswith("reject_card_"))
+async def callback_admin_card_approval(callback: types.CallbackQuery):
+    """Admin approve/reject from Telegram (card payment)"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️ شما ادمین نیستید!", show_alert=True)
+        return
+    
+    parts = callback.data.split("_")
+    action = parts[0]  # approve or reject
+    purchase_id = parts[2]
+    user_id = int(parts[3])
+    purchase_idx = int(parts[4])
+    
+    try:
+        rows = await get_all_rows("Purchases")
+        
+        if purchase_idx < 2 or purchase_idx > len(rows):
+            await callback.answer("❌ سفارش یافت نشد!", show_alert=True)
+            return
+        
+        row = rows[purchase_idx - 1]
+        
+        # Get details
+        product = row[3] if len(row) > 3 else ""
+        amount_usd = float(row[4]) if len(row) > 4 and row[4] else 0
+        payment_method = "card"
+        username = row[2] if len(row) > 2 else ""
+        
+        if action == "approve":
+            # Update sheet with admin_action
+            header = rows[0]
+            try:
+                admin_action_idx = header.index("admin_action")
+                row[admin_action_idx] = "approve"
+                await update_row("Purchases", purchase_idx, row)
+            except ValueError:
+                # Fallback: update status directly
+                status_idx = header.index("status")
+                row[status_idx] = "approved"
+                row[header.index("approved_at")] = now_iso()
+                row[header.index("approved_by")] = str(callback.from_user.id)
+                await update_row("Purchases", purchase_idx, row)
+                
+                # Manually process
+                await activate_subscription(user_id, username, product, payment_method)
+                await process_referral_commission(purchase_id, user_id, amount_usd)
+                
+                result = await find_user(user_id)
+                if result:
+                    _, user_row = result
+                    referral_code = user_row[4] if len(user_row) > 4 else ""
+                    
+                    await bot.send_message(
+                        user_id,
+                        f"🎉 <b>پرداخت تایید شد!</b>\n\n"
+                        f"✅ اشتراک فعال شد\n"
+                        f"📅 مدت: ۶ ماه\n\n"
+                        f"🎁 کد معرف:\n<code>{referral_code}</code>",
+                        parse_mode="HTML",
+                        reply_markup=main_menu_keyboard()
+                    )
+            
+            await callback.message.edit_caption(
+                caption=callback.message.caption + "\n\n✅ <b>تایید شد</b>",
+                parse_mode="HTML"
+            )
+            await callback.answer("✅ تایید شد")
+        
+        else:  # reject
+            # Update sheet
+            header = rows[0]
+            try:
+                admin_action_idx = header.index("admin_action")
+                row[admin_action_idx] = "reject"
+                await update_row("Purchases", purchase_idx, row)
+            except ValueError:
+                status_idx = header.index("status")
+                row[status_idx] = "rejected"
+                row[header.index("approved_at")] = now_iso()
+                row[header.index("approved_by")] = str(callback.from_user.id)
+                await update_row("Purchases", purchase_idx, row)
+                
+                await bot.send_message(
+                    user_id,
+                    "❌ <b>سفارش رد شد</b>\n\n"
+                    "با پشتیبانی تماس بگیرید.",
+                    parse_mode="HTML",
+                    reply_markup=main_menu_keyboard()
+                )
+            
+            await callback.message.edit_caption(
+                caption=callback.message.caption + "\n\n❌ <b>رد شد</b>",
+                parse_mode="HTML"
+            )
+            await callback.answer("❌ رد شد")
+    
+    except Exception as e:
+        logger.exception(f"Error in card approval: {e}")
+        await callback.answer(f"❌ خطا: {e}", show_alert=True)
+
 
 # ============================================
 # ADMIN APPROVAL
@@ -2178,6 +2293,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
