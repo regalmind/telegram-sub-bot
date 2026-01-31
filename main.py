@@ -1585,7 +1585,7 @@ async def callback_withdraw_method(callback: types.CallbackQuery):
 
 @dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state", "").startswith("awaiting_withdraw_"))
 async def handle_withdrawal_request(message: types.Message):
-    """Withdrawal request"""
+    """Handle withdrawal request"""
     user = message.from_user
     state = user_states.get(user.id, {})
     method = state.get("method")
@@ -1594,7 +1594,13 @@ async def handle_withdrawal_request(message: types.Message):
     parts = message.text.strip().split(maxsplit=1)
     
     if len(parts) < 2:
-        await message.reply("❌ فرمت نادرست!")
+        await message.reply(
+            "❌ فرمت نادرست!\n\n"
+            "مثال صحیح:\n"
+            "<code>15 6037991234567890</code> (برای کارت)\n"
+            "<code>20 0x1234...5678</code> (برای تتر)",
+            parse_mode="HTML"
+        )
         return
     
     try:
@@ -1604,66 +1610,162 @@ async def handle_withdrawal_request(message: types.Message):
         return
     
     if amount < 10:
-        await message.reply("❌ حداقل $10!")
+        await message.reply("❌ حداقل برداشت $10 است!")
         return
     
     if amount > balance:
-        await message.reply(f"❌ موجودی کم! موجودی: ${balance:.2f}")
+        await message.reply(f"❌ موجودی کافی نیست! موجودی شما: ${balance:.2f}")
         return
     
     destination = parts[1]
+    
+    # Validate destination format
+    if method == "usdt":
+        if not destination.startswith("0x") or len(destination) < 20:
+            await message.reply(
+                "❌ آدرس ولت نامعتبر!\n\n"
+                "آدرس BEP20 باید با 0x شروع شود.\n"
+                "مثال: <code>0x1234567890abcdef1234567890abcdef12345678</code>",
+                parse_mode="HTML"
+            )
+            return
+    
     withdrawal_id = generate_withdrawal_id()
     
     if method == "card":
         await append_row("Withdrawals", [
-            withdrawal_id, str(user.id), str(amount), "card",
-            "", destination, "pending", now_iso(), "", "", ""
+            withdrawal_id,
+            str(user.id),
+            str(amount),
+            "card",
+            "",
+            destination,
+            "pending",
+            now_iso(),
+            "",
+            "",
+            ""
         ])
     else:
         await append_row("Withdrawals", [
-            withdrawal_id, str(user.id), str(amount), "usdt",
-            destination, "", "pending", now_iso(), "", "", ""
+            withdrawal_id,
+            str(user.id),
+            str(amount),
+            "usdt",
+            destination,
+            "",
+            "pending",
+            now_iso(),
+            "",
+            "",
+            ""
         ])
     
     user_states.pop(user.id, None)
     
     await message.reply(
-        f"✅ <b>درخواست ثبت شد!</b>\n\n"
-        f"🔢 <code>{withdrawal_id}</code>\n"
-        f"💰 ${amount}\n"
-        f"🔄 {'کارت' if method == 'card' else 'تتر'}\n\n"
-        f"⏳ پس از بررسی واریز می‌شود.",
-        parse_mode="HTML"
+        f"✅ <b>درخواست برداشت ثبت شد!</b>\n\n"
+        f"🔢 شناسه: <code>{withdrawal_id}</code>\n"
+        f"💰 مبلغ: <b>${amount}</b>\n"
+        f"🔄 روش: {'کارت بانکی' if method == 'card' else 'تتر BEP20'}\n\n"
+        f"⏳ پس از بررسی، مبلغ واریز می‌شود.",
+        parse_mode="HTML",
+        reply_markup=main_menu_keyboard()
     )
     
+    # Send to admin with inline buttons
     if ADMIN_TELEGRAM_ID:
         try:
-            kb = admin_withdrawal_keyboard(withdrawal_id, user.id)
+            # Get row index for callback
+            rows = await get_all_rows("Withdrawals")
+            withdrawal_idx = len(rows)  # Last row
+            
+            kb = InlineKeyboardMarkup(row_width=2)
+            kb.add(
+                InlineKeyboardButton(
+                    "✅ پرداخت شد", 
+                    callback_data=f"approve_wd_{withdrawal_id}_{user.id}_{withdrawal_idx}"
+                ),
+                InlineKeyboardButton(
+                    "❌ رد", 
+                    callback_data=f"reject_wd_{withdrawal_id}_{user.id}_{withdrawal_idx}"
+                )
+            )
+            
             await bot.send_message(
                 int(ADMIN_TELEGRAM_ID),
-                f"💸 <b>درخواست برداشت</b>\n\n"
-                f"👤 {user.full_name}\n"
-                f"🆔 <code>{user.id}</code>\n"
-                f"💰 ${amount}\n"
-                f"🔄 {'کارت' if method == 'card' else 'تتر'}\n"
-                f"📋 <code>{destination}</code>\n"
-                f"🔢 <code>{withdrawal_id}</code>",
+                f"💸 <b>درخواست برداشت جدید</b>\n\n"
+                f"👤 <b>کاربر:</b> {user.full_name}\n"
+                f"🆔 <b>ID:</b> <code>{user.id}</code>\n"
+                f"💰 <b>مبلغ:</b> ${amount}\n"
+                f"🔄 <b>روش:</b> {'کارت بانکی' if method == 'card' else 'تتر BEP20'}\n"
+                f"📋 <b>مقصد:</b>\n<code>{destination}</code>\n\n"
+                f"🔢 <b>شناسه:</b> <code>{withdrawal_id}</code>",
                 parse_mode="HTML",
                 reply_markup=kb
             )
-        except:
-            pass
+        except Exception as e:
+            logger.exception(f"Failed to notify admin: {e}")
+
 """
 Telegram Subscription Bot - Part 3B (FINAL)
 Admin Commands, Support, Referral & Startup
 """
+
+async def process_withdrawal_approval(withdrawal_id: str, withdrawal_idx: int, 
+                                      user_id: int, amount: float, 
+                                      method: str, destination: str, txid: str):
+    """Process withdrawal approval"""
+    try:
+        # Update sheet
+        rows = await get_all_rows("Withdrawals")
+        if withdrawal_idx >= len(rows):
+            return
+        
+        row = rows[withdrawal_idx - 1]
+        header = rows[0]
+        
+        status_idx = header.index("status")
+        processed_at_idx = header.index("processed_at")
+        processed_by_idx = header.index("processed_by")
+        notes_idx = header.index("notes")
+        
+        row[status_idx] = "completed"
+        row[processed_at_idx] = now_iso()
+        row[processed_by_idx] = "admin"
+        row[notes_idx] = f"TXID: {txid}"
+        
+        await update_row("Withdrawals", withdrawal_idx, row)
+        
+        # Deduct from balance
+        await update_user_balance(user_id, amount, add=False)
+        
+        # Send to user
+        txid_display = f"\n🔗 <b>TXID:</b> <code>{txid}</code>" if method == "usdt" else ""
+        
+        await bot.send_message(
+            user_id,
+            f"✅ <b>برداشت انجام شد!</b>\n\n"
+            f"💰 مبلغ: <b>${amount}</b>\n"
+            f"🔢 شناسه: <code>{withdrawal_id}</code>{txid_display}\n\n"
+            f"مبلغ به {'کارت' if method == 'card' else 'کیف پول'} شما واریز شد.",
+            parse_mode="HTML",
+            reply_markup=main_menu_keyboard()
+        )
+        
+        logger.info(f"✅ Withdrawal {withdrawal_id} approved for user {user_id}")
+    
+    except Exception as e:
+        logger.exception(f"Failed to process withdrawal approval: {e}")
+
+
 
 # ============================================
 # ADMIN WITHDRAWAL APPROVAL
 # ============================================
 @dp.callback_query_handler(lambda c: c.data.startswith("approve_wd_") or c.data.startswith("reject_wd_"))
 async def callback_admin_withdrawal(callback: types.CallbackQuery):
-    """Admin withdrawal approval"""
+    """Admin withdrawal approval from Telegram"""
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔️ شما ادمین نیستید!", show_alert=True)
         return
@@ -1672,71 +1774,86 @@ async def callback_admin_withdrawal(callback: types.CallbackQuery):
     action = parts[0]
     withdrawal_id = parts[2]
     user_id = int(parts[3])
+    withdrawal_idx = int(parts[4])
     
-    rows = await get_all_rows("Withdrawals")
-    withdrawal_row = None
-    withdrawal_idx = None
-    
-    for idx, row in enumerate(rows[1:], start=2):
-        if row and row[0] == withdrawal_id:
-            withdrawal_row = row
-            withdrawal_idx = idx
-            break
-    
-    if not withdrawal_row:
-        await callback.answer("❌ درخواست یافت نشد!", show_alert=True)
-        return
-    
-    amount = float(withdrawal_row[2])
-    
-    if action == "approve":
-        withdrawal_row[6] = "completed"
-        withdrawal_row[8] = now_iso()
-        withdrawal_row[9] = str(callback.from_user.id)
-        await update_row("Withdrawals", withdrawal_idx, withdrawal_row)
+    try:
+        rows = await get_all_rows("Withdrawals")
         
-        await update_user_balance(user_id, amount, add=False)
+        if withdrawal_idx < 2 or withdrawal_idx > len(rows):
+            await callback.answer("❌ درخواست یافت نشد!", show_alert=True)
+            return
         
-        try:
-            await bot.send_message(
-                user_id,
-                f"✅ <b>برداشت انجام شد!</b>\n\n"
-                f"💰 ${amount}\n"
-                f"🔢 <code>{withdrawal_id}</code>\n\n"
-                f"مبلغ واریز شد.",
+        row = rows[withdrawal_idx - 1]
+        amount = float(row[2]) if len(row) > 2 else 0
+        method = row[3] if len(row) > 3 else ""
+        destination = row[4] if len(row) > 4 and method == "usdt" else (row[5] if len(row) > 5 else "")
+        
+        if action == "approve":
+            # Ask for TXID if USDT
+            if method == "usdt":
+                # Store pending approval in user_states
+                user_states[callback.from_user.id] = {
+                    "state": "awaiting_txid_for_withdrawal",
+                    "withdrawal_id": withdrawal_id,
+                    "withdrawal_idx": withdrawal_idx,
+                    "user_id": user_id,
+                    "amount": amount,
+                    "destination": destination
+                }
+                
+                await callback.message.edit_text(
+                    callback.message.text + "\n\n⏳ <b>در حال پردازش...</b>\n\n"
+                    "لطفاً <b>Transaction ID (TXID)</b> واریز را ارسال کنید:",
+                    parse_mode="HTML"
+                )
+                await callback.answer("لطفاً TXID را ارسال کنید")
+            else:
+                # Card payment - process immediately
+                await process_withdrawal_approval(
+                    withdrawal_id, withdrawal_idx, user_id, amount, 
+                    method, destination, "manual_card_payment"
+                )
+                
+                await callback.message.edit_text(
+                    callback.message.text + "\n\n✅ <b>تایید شد و پردازش شد</b>",
+                    parse_mode="HTML"
+                )
+                await callback.answer("✅ تایید شد")
+        
+        else:  # reject
+            # Update sheet
+            header = rows[0]
+            status_idx = header.index("status")
+            processed_at_idx = header.index("processed_at")
+            processed_by_idx = header.index("processed_by")
+            
+            row[status_idx] = "rejected"
+            row[processed_at_idx] = now_iso()
+            row[processed_by_idx] = str(callback.from_user.id)
+            await update_row("Withdrawals", withdrawal_idx, row)
+            
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"❌ <b>درخواست برداشت رد شد</b>\n\n"
+                    f"🔢 شناسه: <code>{withdrawal_id}</code>\n\n"
+                    f"لطفاً با پشتیبانی تماس بگیرید.",
+                    parse_mode="HTML",
+                    reply_markup=main_menu_keyboard()
+                )
+            except:
+                pass
+            
+            await callback.message.edit_text(
+                callback.message.text + "\n\n❌ <b>رد شد</b>",
                 parse_mode="HTML"
             )
-        except:
-            pass
-        
-        await callback.message.edit_text(
-            callback.message.text + "\n\n✅ <b>پرداخت شد</b>",
-            parse_mode="HTML"
-        )
-        await callback.answer("✅ پرداخت شد")
+            await callback.answer("❌ رد شد")
     
-    else:
-        withdrawal_row[6] = "rejected"
-        withdrawal_row[8] = now_iso()
-        withdrawal_row[9] = str(callback.from_user.id)
-        await update_row("Withdrawals", withdrawal_idx, withdrawal_row)
-        
-        try:
-            await bot.send_message(
-                user_id,
-                f"❌ <b>درخواست رد شد</b>\n\n"
-                f"🔢 <code>{withdrawal_id}</code>\n\n"
-                f"با پشتیبانی تماس بگیرید.",
-                parse_mode="HTML"
-            )
-        except:
-            pass
-        
-        await callback.message.edit_text(
-            callback.message.text + "\n\n❌ <b>رد شد</b>",
-            parse_mode="HTML"
-        )
-        await callback.answer("❌ رد شد")
+    except Exception as e:
+        logger.exception(f"Error in withdrawal approval: {e}")
+        await callback.answer(f"❌ خطا: {e}", show_alert=True)
+
 
 # ============================================
 # REFERRAL SYSTEM
@@ -1879,6 +1996,41 @@ async def handle_help(message: types.Message):
         reply_markup=main_menu_keyboard()
     )
 
+@dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_txid_for_withdrawal")
+async def handle_txid_for_withdrawal(message: types.Message):
+    """Handle TXID from admin for withdrawal approval"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    state = user_states.get(message.from_user.id, {})
+    withdrawal_id = state.get("withdrawal_id")
+    withdrawal_idx = state.get("withdrawal_idx")
+    user_id = state.get("user_id")
+    amount = state.get("amount")
+    destination = state.get("destination")
+    
+    txid = message.text.strip()
+    
+    if len(txid) < 20:
+        await message.reply("❌ TXID نامعتبر است. لطفاً TXID صحیح را ارسال کنید.")
+        return
+    
+    # Process approval
+    await process_withdrawal_approval(
+        withdrawal_id, withdrawal_idx, user_id, 
+        amount, "usdt", destination, txid
+    )
+    
+    user_states.pop(message.from_user.id, None)
+    
+    await message.reply(
+        f"✅ <b>برداشت تایید و پردازش شد</b>\n\n"
+        f"💰 مبلغ: ${amount}\n"
+        f"🔗 TXID: <code>{txid}</code>\n\n"
+        f"کاربر مطلع شد.",
+        parse_mode="HTML"
+    )
+
 
 # ============================================
 # ADMIN COMMANDS
@@ -1997,6 +2149,97 @@ async def callback_back_to_buy(callback: types.CallbackQuery):
         reply_markup=kb
     )
     await callback.answer()
+
+            # ============ Process Withdrawals ============
+            withdrawal_rows = await get_all_rows("Withdrawals")
+            
+            if withdrawal_rows and len(withdrawal_rows) > 1:
+                wd_header = withdrawal_rows[0]
+                
+                try:
+                    wd_id_idx = wd_header.index("withdrawal_id")
+                    wd_telegram_id_idx = wd_header.index("telegram_id")
+                    wd_amount_idx = wd_header.index("amount_usd")
+                    wd_method_idx = wd_header.index("method")
+                    wd_wallet_idx = wd_header.index("wallet_address")
+                    wd_status_idx = wd_header.index("status")
+                    wd_notes_idx = wd_header.index("notes")
+                    wd_processed_at_idx = wd_header.index("processed_at")
+                except ValueError as e:
+                    logger.error(f"Missing column in Withdrawals: {e}")
+                    await asyncio.sleep(30)
+                    continue
+                
+                for idx, row in enumerate(withdrawal_rows[1:], start=2):
+                    if not row or len(row) <= wd_status_idx:
+                        continue
+                    
+                    try:
+                        status = row[wd_status_idx].strip().lower() if len(row) > wd_status_idx else ""
+                        notes = row[wd_notes_idx].strip() if len(row) > wd_notes_idx else ""
+                        processed_at = row[wd_processed_at_idx].strip() if len(row) > wd_processed_at_idx else ""
+                        
+                        # Skip if already processed or no processed_at
+                        if "processed" in notes.lower() or not processed_at:
+                            continue
+                        
+                        withdrawal_id = row[wd_id_idx] if len(row) > wd_id_idx else ""
+                        telegram_id = int(row[wd_telegram_id_idx]) if len(row) > wd_telegram_id_idx and row[wd_telegram_id_idx] else 0
+                        amount = float(row[wd_amount_idx]) if len(row) > wd_amount_idx and row[wd_amount_idx] else 0
+                        method = row[wd_method_idx] if len(row) > wd_method_idx else ""
+                        
+                        if not telegram_id:
+                            continue
+                        
+                        if status == "completed":
+                            logger.info(f"💸 Processing withdrawal {withdrawal_id} from sheet")
+                            
+                            # Deduct balance
+                            await update_user_balance(telegram_id, amount, add=False)
+                            
+                            # Extract TXID from notes
+                            txid = notes if notes and not "processed" in notes.lower() else ""
+                            txid_display = f"\n🔗 <b>TXID:</b> <code>{txid}</code>" if txid else ""
+                            
+                            try:
+                                await bot.send_message(
+                                    telegram_id,
+                                    f"✅ <b>برداشت انجام شد!</b>\n\n"
+                                    f"💰 ${amount}\n"
+                                    f"🔢 <code>{withdrawal_id}</code>{txid_display}\n\n"
+                                    f"مبلغ واریز شد.",
+                                    parse_mode="HTML",
+                                    reply_markup=main_menu_keyboard()
+                                )
+                            except:
+                                pass
+                            
+                            # Mark as processed
+                            row[wd_notes_idx] = notes + " [auto_processed]" if notes else "auto_processed"
+                            await update_row("Withdrawals", idx, row)
+                        
+                        elif status == "rejected":
+                            logger.info(f"❌ Processing rejection {withdrawal_id} from sheet")
+                            
+                            try:
+                                await bot.send_message(
+                                    telegram_id,
+                                    f"❌ <b>درخواست برداشت رد شد</b>\n\n"
+                                    f"🔢 <code>{withdrawal_id}</code>\n\n"
+                                    f"با پشتیبانی تماس بگیرید.",
+                                    parse_mode="HTML",
+                                    reply_markup=main_menu_keyboard()
+                                )
+                            except:
+                                pass
+                            
+                            # Mark as processed
+                            row[wd_notes_idx] = notes + " [auto_processed]" if notes else "auto_processed"
+                            await update_row("Withdrawals", idx, row)
+                    
+                    except Exception as e:
+                        logger.exception(f"Error processing withdrawal row {idx}: {e}")
+
 
 # ============================================
 # AUTO-PROCESS PURCHASES & TICKETS
@@ -2293,6 +2536,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
