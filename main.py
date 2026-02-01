@@ -753,6 +753,8 @@ async def activate_subscription(telegram_id: int, username: str, product: str, p
     
     delay = (expires - datetime.utcnow()).total_seconds()
     asyncio.create_task(schedule_expiry(telegram_id, channels, delay))
+    asyncio.create_task(schedule_expiry_reminders(telegram_id, expires))
+
 
 async def schedule_expiry(telegram_id: int, channels: List[str], delay: float):
     """Schedule subscription expiry"""
@@ -785,6 +787,67 @@ async def schedule_expiry(telegram_id: int, channels: List[str], delay: float):
         pass
     except Exception as e:
         logger.exception(f"Error in expiry: {e}")
+
+async def schedule_expiry_reminders(telegram_id: int, expires: datetime):
+    """Schedule expiry reminder notifications"""
+    try:
+        now = datetime.utcnow()
+        
+        # محاسبه زمان‌های یادآوری
+        seven_days_before = (expires - timedelta(days=7) - now).total_seconds()
+        three_days_before = (expires - timedelta(days=3) - now).total_seconds()
+        one_day_before = (expires - timedelta(days=1) - now).total_seconds()
+        
+        # یادآوری ۷ روز مانده
+        if seven_days_before > 0:
+            await asyncio.sleep(seven_days_before)
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    "⏰ <b>یادآوری اشتراک</b>\n\n"
+                    "۷ روز دیگر اشتراک شما به پایان می‌رسد.\n\n"
+                    "💡 برای تمدید از منوی 💎 خرید اشتراک استفاده کنید.\n\n"
+                    "🎁 با دعوت دوستان، پورسانت کسب کنید و رایگان تمدید کنید!",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+        
+        # یادآوری ۳ روز مانده
+        if three_days_before > 0:
+            await asyncio.sleep(max(0, three_days_before - seven_days_before))
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    "⚠️ <b>هشدار انقضا</b>\n\n"
+                    "فقط <b>۳ روز</b> تا پایان اشتراک شما باقی مانده!\n\n"
+                    "💎 همین الان تمدید کنید تا از کانال‌ها خارج نشوید.",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+        
+        # یادآوری ۱ روز مانده
+        if one_day_before > 0:
+            await asyncio.sleep(max(0, one_day_before - three_days_before))
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    "🔴 <b>هشدار نهایی!</b>\n\n"
+                    "فقط <b>۱ روز</b> تا پایان اشتراک شما!\n\n"
+                    "⏰ فردا از کانال‌ها حذف می‌شوید.\n\n"
+                    "💎 الان تمدید کنید!",
+                    parse_mode="HTML",
+                    reply_markup=subscription_keyboard()
+                )
+            except:
+                pass
+        
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        logger.exception(f"Error in expiry reminders: {e}")
+
 
 # ============================================
 # COMMAND HANDLERS
@@ -2570,6 +2633,7 @@ async def rebuild_subscription_schedules():
                 channels = [PREMIUM_CHANNEL_ID, NORMAL_CHANNEL_ID] if product == "premium" else [NORMAL_CHANNEL_ID]
                 asyncio.create_task(schedule_expiry(telegram_id, channels, delay))
                 logger.info(f"✅ Scheduled expiry for {telegram_id} in {delay/3600:.1f}h")
+                asyncio.create_task(schedule_expiry_reminders(telegram_id, expires))
     except Exception as e:
         logger.exception(f"Rebuild schedules failed: {e}")
 
@@ -2616,6 +2680,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
