@@ -144,7 +144,7 @@ SHEET_DEFINITIONS = {
     ],
     "Config": [
         "key", "value", "description"
-    ]
+    ],
     "DiscountCodes": [
     "code", "discount_percent", "max_uses", "used_count",
     "valid_until", "created_by", "created_at", "status"
@@ -3109,6 +3109,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
