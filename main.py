@@ -257,6 +257,33 @@ user_states = {}
 _last_bot_messages = {}
 
 # ============================================
+# MIDDLEWARE: Channel Membership Check
+# ============================================
+async def check_membership_for_all_messages(message: types.Message):
+    """Check if user is still member of required channels"""
+    user = message.from_user
+    
+    # فقط برای پیام‌های متنی که دستور /start نیستن
+    if not message.text or message.text.startswith("/start"):
+        return True
+    
+    is_member, missing = await check_required_channels(user.id)
+    
+    if not is_member:
+        kb = channel_membership_keyboard(missing)
+        await send_and_record(
+            user.id,
+            "⚠️ <b>شما از کانال خارج شده‌اید!</b>\n\n"
+            "برای ادامه استفاده از ربات باید دوباره عضو شوید.",
+            parse_mode="HTML",
+            reply_markup=kb
+        )
+        return False
+    
+    return True
+
+
+# ============================================
 # UTILITY FUNCTIONS
 # ============================================
 def now_iso() -> str:
@@ -560,10 +587,12 @@ def channel_membership_keyboard(missing_channels: List[str]):
     kb = InlineKeyboardMarkup(row_width=1)
     
     for channel in missing_channels:
-        channel_name = channel.replace("@", "")
+        # حذف @ اگه وجود داره
+        channel_clean = channel.lstrip("@")
+        
         kb.add(InlineKeyboardButton(
-            f"📢 عضویت در {channel}",
-            url=f"https://t.me/{channel_name}"
+            f"📢 عضویت در @{channel_clean}",
+            url=f"https://t.me/{channel_clean}"
         ))
     
     kb.add(InlineKeyboardButton("✅ بررسی عضویت", callback_data="check_membership"))
@@ -766,6 +795,7 @@ async def cmd_start(message: types.Message):
     user = message.from_user
     args = message.get_args()
     
+    # ✅ اول از همه چک عضویت کانال
     is_member, missing = await check_required_channels(user.id)
     
     if not is_member:
@@ -779,12 +809,14 @@ async def cmd_start(message: types.Message):
         )
         return
     
+    # ✅ چک کردن یوزر در دیتابیس
     result = await find_user(user.id)
     
     if result:
         row_idx, row = result
         email = row[3] if len(row) > 3 else ""
         
+        # اگر ایمیل نداره، بگیر
         if not email:
             user_states[user.id] = {"state": "awaiting_email", "attempt": 1}
             await send_and_record(
@@ -795,6 +827,7 @@ async def cmd_start(message: types.Message):
             )
             return
     else:
+        # ✅ یوزر جدیده - ثبت کن
         referred_by = ""
         if args:
             rows = await get_all_rows("Users")
@@ -807,7 +840,7 @@ async def cmd_start(message: types.Message):
             str(user.id),
             user.username or "",
             user.full_name or "",
-            "",
+            "",  # ایمیل خالی
             generate_referral_code(),
             referred_by,
             "0",
@@ -818,6 +851,7 @@ async def cmd_start(message: types.Message):
         
         await append_row("Users", new_row)
         
+        # درخواست ایمیل
         user_states[user.id] = {"state": "awaiting_email", "attempt": 1}
         await send_and_record(
             user.id,
@@ -828,6 +862,7 @@ async def cmd_start(message: types.Message):
         )
         return
     
+    # ✅ نمایش منوی اصلی
     subscription = await get_active_subscription(user.id)
     
     if subscription:
@@ -854,6 +889,7 @@ async def cmd_start(message: types.Message):
             parse_mode="HTML",
             reply_markup=main_menu_keyboard()
         )
+
 
 @dp.callback_query_handler(lambda c: c.data == "check_membership")
 async def callback_check_membership(callback: types.CallbackQuery):
@@ -951,6 +987,13 @@ async def handle_test_channel(message: types.Message):
     """Test channel handler"""
     user = message.from_user
     
+    # ✅ چک عضویت
+    if not await check_membership_for_all_messages(message):
+        return
+    
+    # ... بقیه کد
+
+    
     if not TEST_CHANNEL_ID:
         await message.reply("❌ کانال تست در دسترس نیست.")
         return
@@ -1002,6 +1045,13 @@ async def schedule_test_removal(user_id: int, channel_id: str):
 @dp.message_handler(lambda msg: msg.text == "💎 خرید اشتراک")
 async def handle_buy_subscription(message: types.Message):
     """Buy subscription"""
+    
+    # ✅ چک عضویت
+    if not await check_membership_for_all_messages(message):
+        return
+    
+    # ... بقیه کد
+
     kb = subscription_keyboard()
     await send_and_record(
         message.from_user.id,
@@ -1461,6 +1511,13 @@ async def callback_admin_purchase(callback: types.CallbackQuery):
 async def handle_wallet(message: types.Message):
     """Wallet handler"""
     user = message.from_user
+    
+    # ✅ چک عضویت
+    if not await check_membership_for_all_messages(message):
+        return
+    
+    # ... بقیه کد
+
     balance = await get_user_balance(user.id)
     
     rows = await get_all_rows("Referrals")
@@ -1863,6 +1920,13 @@ async def handle_referral(message: types.Message):
     """Referral handler"""
     user = message.from_user
     
+    # ✅ چک عضویت
+    if not await check_membership_for_all_messages(message):
+        return
+    
+    # ... بقیه کد
+
+    
     # Check if user has active subscription
     subscription = await get_active_subscription(user.id)
     
@@ -1924,6 +1988,13 @@ async def handle_referral(message: types.Message):
 @dp.message_handler(lambda msg: msg.text == "💬 پشتیبانی")
 async def handle_support(message: types.Message):
     """Support handler"""
+    
+    # ✅ چک عضویت
+    if not await check_membership_for_all_messages(message):
+        return
+    
+    # ... بقیه کد
+
     user_states[message.from_user.id] = {"state": "awaiting_support_message"}
     
     await message.reply(
@@ -1974,6 +2045,13 @@ async def handle_support_message(message: types.Message):
 @dp.message_handler(lambda msg: msg.text == "📚 راهنما")
 async def handle_help(message: types.Message):
     """Help handler"""
+    
+    # ✅ چک عضویت
+    if not await check_membership_for_all_messages(message):
+        return
+    
+    # ... بقیه کد
+
     await message.reply(
         "📚 <b>راهنما</b>\n\n"
         "🆓 <b>تست کانال:</b>\n"
@@ -2538,6 +2616,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
