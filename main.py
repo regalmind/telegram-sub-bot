@@ -2150,97 +2150,6 @@ async def callback_back_to_buy(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-            # ============ Process Withdrawals ============
-            withdrawal_rows = await get_all_rows("Withdrawals")
-            
-            if withdrawal_rows and len(withdrawal_rows) > 1:
-                wd_header = withdrawal_rows[0]
-                
-                try:
-                    wd_id_idx = wd_header.index("withdrawal_id")
-                    wd_telegram_id_idx = wd_header.index("telegram_id")
-                    wd_amount_idx = wd_header.index("amount_usd")
-                    wd_method_idx = wd_header.index("method")
-                    wd_wallet_idx = wd_header.index("wallet_address")
-                    wd_status_idx = wd_header.index("status")
-                    wd_notes_idx = wd_header.index("notes")
-                    wd_processed_at_idx = wd_header.index("processed_at")
-                except ValueError as e:
-                    logger.error(f"Missing column in Withdrawals: {e}")
-                    await asyncio.sleep(30)
-                    continue
-                
-                for idx, row in enumerate(withdrawal_rows[1:], start=2):
-                    if not row or len(row) <= wd_status_idx:
-                        continue
-                    
-                    try:
-                        status = row[wd_status_idx].strip().lower() if len(row) > wd_status_idx else ""
-                        notes = row[wd_notes_idx].strip() if len(row) > wd_notes_idx else ""
-                        processed_at = row[wd_processed_at_idx].strip() if len(row) > wd_processed_at_idx else ""
-                        
-                        # Skip if already processed or no processed_at
-                        if "processed" in notes.lower() or not processed_at:
-                            continue
-                        
-                        withdrawal_id = row[wd_id_idx] if len(row) > wd_id_idx else ""
-                        telegram_id = int(row[wd_telegram_id_idx]) if len(row) > wd_telegram_id_idx and row[wd_telegram_id_idx] else 0
-                        amount = float(row[wd_amount_idx]) if len(row) > wd_amount_idx and row[wd_amount_idx] else 0
-                        method = row[wd_method_idx] if len(row) > wd_method_idx else ""
-                        
-                        if not telegram_id:
-                            continue
-                        
-                        if status == "completed":
-                            logger.info(f"💸 Processing withdrawal {withdrawal_id} from sheet")
-                            
-                            # Deduct balance
-                            await update_user_balance(telegram_id, amount, add=False)
-                            
-                            # Extract TXID from notes
-                            txid = notes if notes and not "processed" in notes.lower() else ""
-                            txid_display = f"\n🔗 <b>TXID:</b> <code>{txid}</code>" if txid else ""
-                            
-                            try:
-                                await bot.send_message(
-                                    telegram_id,
-                                    f"✅ <b>برداشت انجام شد!</b>\n\n"
-                                    f"💰 ${amount}\n"
-                                    f"🔢 <code>{withdrawal_id}</code>{txid_display}\n\n"
-                                    f"مبلغ واریز شد.",
-                                    parse_mode="HTML",
-                                    reply_markup=main_menu_keyboard()
-                                )
-                            except:
-                                pass
-                            
-                            # Mark as processed
-                            row[wd_notes_idx] = notes + " [auto_processed]" if notes else "auto_processed"
-                            await update_row("Withdrawals", idx, row)
-                        
-                        elif status == "rejected":
-                            logger.info(f"❌ Processing rejection {withdrawal_id} from sheet")
-                            
-                            try:
-                                await bot.send_message(
-                                    telegram_id,
-                                    f"❌ <b>درخواست برداشت رد شد</b>\n\n"
-                                    f"🔢 <code>{withdrawal_id}</code>\n\n"
-                                    f"با پشتیبانی تماس بگیرید.",
-                                    parse_mode="HTML",
-                                    reply_markup=main_menu_keyboard()
-                                )
-                            except:
-                                pass
-                            
-                            # Mark as processed
-                            row[wd_notes_idx] = notes + " [auto_processed]" if notes else "auto_processed"
-                            await update_row("Withdrawals", idx, row)
-                    
-                    except Exception as e:
-                        logger.exception(f"Error processing withdrawal row {idx}: {e}")
-
-
 # ============================================
 # AUTO-PROCESS PURCHASES & TICKETS
 # ============================================
@@ -2365,6 +2274,99 @@ async def poll_sheets_auto_process():
                 
                 except Exception as e:
                     logger.exception(f"Error processing purchase row {idx}: {e}")
+
+
+            # ============ Process Withdrawals ============
+            withdrawal_rows = await get_all_rows("Withdrawals")
+            
+            if withdrawal_rows and len(withdrawal_rows) > 1:
+                wd_header = withdrawal_rows[0]
+                
+                try:
+                    wd_id_idx = wd_header.index("withdrawal_id")
+                    wd_telegram_id_idx = wd_header.index("telegram_id")
+                    wd_amount_idx = wd_header.index("amount_usd")
+                    wd_method_idx = wd_header.index("method")
+                    wd_wallet_idx = wd_header.index("wallet_address")
+                    wd_status_idx = wd_header.index("status")
+                    wd_notes_idx = wd_header.index("notes")
+                    wd_processed_at_idx = wd_header.index("processed_at")
+                except ValueError as e:
+                    logger.error(f"Missing column in Withdrawals: {e}")
+                    await asyncio.sleep(30)
+                    continue
+                
+                for idx, row in enumerate(withdrawal_rows[1:], start=2):
+                    if not row or len(row) <= wd_status_idx:
+                        continue
+                    
+                    try:
+                        status = row[wd_status_idx].strip().lower() if len(row) > wd_status_idx else ""
+                        notes = row[wd_notes_idx].strip() if len(row) > wd_notes_idx else ""
+                        processed_at = row[wd_processed_at_idx].strip() if len(row) > wd_processed_at_idx else ""
+                        
+                        # Skip if already processed or no processed_at
+                        if "processed" in notes.lower() or not processed_at:
+                            continue
+                        
+                        withdrawal_id = row[wd_id_idx] if len(row) > wd_id_idx else ""
+                        telegram_id = int(row[wd_telegram_id_idx]) if len(row) > wd_telegram_id_idx and row[wd_telegram_id_idx] else 0
+                        amount = float(row[wd_amount_idx]) if len(row) > wd_amount_idx and row[wd_amount_idx] else 0
+                        method = row[wd_method_idx] if len(row) > wd_method_idx else ""
+                        
+                        if not telegram_id:
+                            continue
+                        
+                        if status == "completed":
+                            logger.info(f"💸 Processing withdrawal {withdrawal_id} from sheet")
+                            
+                            # Deduct balance
+                            await update_user_balance(telegram_id, amount, add=False)
+                            
+                            # Extract TXID from notes
+                            txid = notes if notes and not "processed" in notes.lower() else ""
+                            txid_display = f"\n🔗 <b>TXID:</b> <code>{txid}</code>" if txid else ""
+                            
+                            try:
+                                await bot.send_message(
+                                    telegram_id,
+                                    f"✅ <b>برداشت انجام شد!</b>\n\n"
+                                    f"💰 ${amount}\n"
+                                    f"🔢 <code>{withdrawal_id}</code>{txid_display}\n\n"
+                                    f"مبلغ واریز شد.",
+                                    parse_mode="HTML",
+                                    reply_markup=main_menu_keyboard()
+                                )
+                            except:
+                                pass
+                            
+                            # Mark as processed
+                            row[wd_notes_idx] = notes + " [auto_processed]" if notes else "auto_processed"
+                            await update_row("Withdrawals", idx, row)
+                        
+                        elif status == "rejected":
+                            logger.info(f"❌ Processing rejection {withdrawal_id} from sheet")
+                            
+                            try:
+                                await bot.send_message(
+                                    telegram_id,
+                                    f"❌ <b>درخواست برداشت رد شد</b>\n\n"
+                                    f"🔢 <code>{withdrawal_id}</code>\n\n"
+                                    f"با پشتیبانی تماس بگیرید.",
+                                    parse_mode="HTML",
+                                    reply_markup=main_menu_keyboard()
+                                )
+                            except:
+                                pass
+                            
+                            # Mark as processed
+                            row[wd_notes_idx] = notes + " [auto_processed]" if notes else "auto_processed"
+                            await update_row("Withdrawals", idx, row)
+                    
+                    except Exception as e:
+                        logger.exception(f"Error processing withdrawal row {idx}: {e}")
+
+
             
             # ============ Process Tickets ============
             ticket_rows = await get_all_rows("Tickets")
@@ -2536,6 +2538,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
