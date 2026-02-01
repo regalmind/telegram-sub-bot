@@ -145,6 +145,10 @@ SHEET_DEFINITIONS = {
     "Config": [
         "key", "value", "description"
     ]
+    "DiscountCodes": [
+    "code", "discount_percent", "max_uses", "used_count",
+    "valid_until", "created_by", "created_at", "status"
+    ]
 }
 
 # ============================================
@@ -547,6 +551,7 @@ def subscription_keyboard():
             f"💎 اشتراک ویژه - ${PREMIUM_PRICE}",
             callback_data="buy_premium"
         ),
+        InlineKeyboardButton("🎟 کد تخفیف دارم", callback_data="enter_discount"),
         InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_menu")
     )
     return kb
@@ -849,6 +854,244 @@ async def schedule_expiry_reminders(telegram_id: int, expires: datetime):
         logger.exception(f"Error in expiry reminders: {e}")
 
 
+async def generate_monthly_report(telegram_id: int) -> str:
+    """Generate monthly activity report for user"""
+    try:
+        # دریافت اطلاعات کاربر
+        user_result = await find_user(telegram_id)
+        if not user_result:
+            return None
+        
+        _, user_row = user_result
+        username = user_row[1] if len(user_row) > 1 else "کاربر"
+        
+        # محاسبه تعداد معرفی‌های ماه جاری
+        referrals_rows = await get_all_rows("Referrals")
+        now = datetime.utcnow()
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        
+        monthly_referrals = 0
+        monthly_earnings = 0.0
+        
+        for row in referrals_rows[1:]:
+            if not row or len(row) < 7:
+                continue
+            
+            if str(row[0]) != str(telegram_id):
+                continue
+            
+            created_at = parse_iso(row[6]) if len(row) > 6 else None
+            if created_at and created_at >= month_start:
+                monthly_referrals += 1
+                try:
+                    monthly_earnings += float(row[3]) if len(row) > 3 else 0
+                except:
+                    pass
+        
+        # محاسبه کل معرفی‌ها و درآمد
+        total_referrals = sum(1 for row in referrals_rows[1:] if row and str(row[0]) == str(telegram_id))
+        total_earnings = 0.0
+        for row in referrals_rows[1:]:
+            if row and str(row[0]) == str(telegram_id):
+                try:
+                    total_earnings += float(row[3]) if len(row) > 3 else 0
+                except:
+                    pass
+        
+        # محاسبه رتبه
+        users_earnings = {}
+        for row in referrals_rows[1:]:
+            if not row or len(row) < 4:
+                continue
+            referrer = str(row[0])
+            try:
+                amount = float(row[3])
+                users_earnings[referrer] = users_earnings.get(referrer, 0) + amount
+            except:
+                pass
+        
+        sorted_users = sorted(users_earnings.items(), key=lambda x: x[1], reverse=True)
+        rank = next((i+1 for i, (uid, _) in enumerate(sorted_users) if uid == str(telegram_id)), len(sorted_users))
+        
+        # ساخت پیام
+        month_name = now.strftime("%B %Y")
+        
+        report = (
+            f"📊 <b>گزارش ماهانه - {month_name}</b>\n\n"
+            f"👤 <b>{username}</b>\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"📅 <b>این ماه:</b>\n"
+            f"👥 معرفی‌ها: <b>{monthly_referrals}</b> نفر\n"
+            f"💰 درآمد: <b>${monthly_earnings:.2f}</b>\n\n"
+            f"📊 <b>کل:</b>\n"
+            f"👥 کل معرفی‌ها: <b>{total_referrals}</b> نفر\n"
+            f"💵 کل درآمد: <b>${total_earnings:.2f}</b>\n\n"
+            f"🏆 <b>رتبه شما:</b> #{rank} از {len(users_earnings)} نفر\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        )
+        
+        # پیام انگیزشی بر اساس عملکرد
+        if monthly_referrals == 0:
+            report += "💡 این ماه هیچ معرفی نداشتید!\n🎯 با دعوت دوستان درآمد کسب کنید."
+        elif monthly_referrals < 3:
+            report += f"👍 عملکرد خوب!\n🚀 با {3 - monthly_referrals} معرفی دیگه به هدف ماهانه برسید."
+        else:
+            report += f"🔥 عالی! {monthly_referrals} معرفی در این ماه!\n🌟 به همین روال ادامه دهید."
+        
+        return report
+        
+    except Exception as e:
+        logger.exception(f"Error generating monthly report: {e}")
+        return None
+
+
+async def send_monthly_reports():
+    """Send monthly reports to all active users"""
+    while True:
+        try:
+            # محاسبه زمان تا اول ماه آینده
+            now = datetime.utcnow()
+            next_month = (now.replace(day=1) + timedelta(days=32)).replace(day=1, hour=10, minute=0, second=0, microsecond=0)
+            delay = (next_month - now).total_seconds()
+            
+            logger.info(f"📅 Next monthly report in {delay/3600/24:.1f} days")
+            await asyncio.sleep(delay)
+            
+            # ارسال گزارش به همه کاربران فعال
+            users_rows = await get_all_rows("Users")
+            sent = 0
+            failed = 0
+            
+            for row in users_rows[1:]:
+                if not row or len(row) < 8:
+                    continue
+                
+                telegram_id = int(row[0])
+                status = row[7] if len(row) > 7 else ""
+                
+                # فقط برای کاربران فعال
+                if status != "active":
+                    continue
+                
+                try:
+                    report = await generate_monthly_report(telegram_id)
+                    if report:
+                        await bot.send_message(
+                            telegram_id,
+                            report,
+                            parse_mode="HTML",
+                            reply_markup=main_menu_keyboard()
+                        )
+                        sent += 1
+                        await asyncio.sleep(0.1)  # جلوگیری از spam
+                except Exception as e:
+                    logger.error(f"Failed to send report to {telegram_id}: {e}")
+                    failed += 1
+            
+            logger.info(f"✅ Monthly reports sent: {sent}, failed: {failed}")
+            
+        except Exception as e:
+            logger.exception(f"Error in monthly reports: {e}")
+            await asyncio.sleep(3600)  # retry after 1 hour
+
+
+async def create_discount_code(code: str, discount_percent: int, max_uses: int, valid_days: int, created_by: int) -> bool:
+    """Create a new discount code"""
+    try:
+        # چک کد تکراری
+        rows = await get_all_rows("DiscountCodes")
+        for row in rows[1:]:
+            if row and row[0].upper() == code.upper():
+                return False  # کد تکراری
+        
+        valid_until = (datetime.utcnow() + timedelta(days=valid_days)).replace(microsecond=0).isoformat()
+        
+        await append_row("DiscountCodes", [
+            code.upper(),
+            str(discount_percent),
+            str(max_uses),
+            "0",  # used_count
+            valid_until,
+            str(created_by),
+            now_iso(),
+            "active"
+        ])
+        
+        logger.info(f"✅ Discount code created: {code}")
+        return True
+        
+    except Exception as e:
+        logger.exception(f"Error creating discount code: {e}")
+        return False
+
+
+async def validate_discount_code(code: str) -> Optional[Tuple[int, int]]:
+    """
+    Validate discount code and return (discount_percent, row_index) or None
+    """
+    try:
+        rows = await get_all_rows("DiscountCodes")
+        now = datetime.utcnow()
+        
+        for idx, row in enumerate(rows[1:], start=2):
+            if not row or len(row) < 8:
+                continue
+            
+            if row[0].upper() != code.upper():
+                continue
+            
+            # چک وضعیت
+            status = row[7] if len(row) > 7 else ""
+            if status != "active":
+                return None
+            
+            # چک تاریخ انقضا
+            valid_until = parse_iso(row[4]) if len(row) > 4 else None
+            if valid_until and valid_until < now:
+                return None
+            
+            # چک تعداد استفاده
+            max_uses = int(row[2]) if len(row) > 2 and row[2] else 0
+            used_count = int(row[3]) if len(row) > 3 and row[3] else 0
+            
+            if max_uses > 0 and used_count >= max_uses:
+                return None
+            
+            # برگرداندن درصد تخفیف و ایندکس
+            discount = int(row[1]) if len(row) > 1 else 0
+            return (discount, idx)
+        
+        return None
+        
+    except Exception as e:
+        logger.exception(f"Error validating code: {e}")
+        return None
+
+
+async def use_discount_code(code: str) -> bool:
+    """Mark discount code as used (increment counter)"""
+    try:
+        rows = await get_all_rows("DiscountCodes")
+        
+        for idx, row in enumerate(rows[1:], start=2):
+            if not row or row[0].upper() != code.upper():
+                continue
+            
+            # افزایش شمارنده
+            used_count = int(row[3]) if len(row) > 3 and row[3] else 0
+            row[3] = str(used_count + 1)
+            
+            await update_row("DiscountCodes", idx, row)
+            logger.info(f"✅ Discount code used: {code} ({used_count + 1} times)")
+            return True
+        
+        return False
+        
+    except Exception as e:
+        logger.exception(f"Error using discount code: {e}")
+        return False
+
+
 # ============================================
 # COMMAND HANDLERS
 # ============================================
@@ -1147,6 +1390,57 @@ async def callback_buy(callback: types.CallbackQuery):
     )
     await callback.answer()
 
+@dp.callback_query_handler(lambda c: c.data == "enter_discount")
+async def callback_enter_discount(callback: types.CallbackQuery):
+    """Enter discount code"""
+    user = callback.from_user
+    
+    user_states[user.id] = {"state": "awaiting_discount_code"}
+    
+    await callback.message.edit_text(
+        "🎟 <b>کد تخفیف</b>\n\n"
+        "لطفاً کد تخفیف خود را وارد کنید:\n\n"
+        "مثال: <code>SUMMER20</code>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_discount_code")
+async def handle_discount_code_input(message: types.Message):
+    """Handle discount code input"""
+    user = message.from_user
+    code = message.text.strip().upper()
+    
+    validation = await validate_discount_code(code)
+    
+    if validation:
+        discount_percent, _ = validation
+        user_states[user.id] = {
+            "state": "discount_validated",
+            "discount_code": code,
+            "discount_percent": discount_percent
+        }
+        
+        await message.reply(
+            f"✅ <b>کد تخفیف معتبر!</b>\n\n"
+            f"🎟 کد: <code>{code}</code>\n"
+            f"💰 تخفیف: <b>{discount_percent}%</b>\n\n"
+            f"حالا اشتراک مورد نظر را انتخاب کنید:",
+            parse_mode="HTML",
+            reply_markup=subscription_keyboard()
+        )
+    else:
+        user_states.pop(user.id, None)
+        
+        await message.reply(
+            "❌ <b>کد تخفیف نامعتبر!</b>\n\n"
+            "کد وارد شده منقضی شده یا اشتباه است.",
+            parse_mode="HTML",
+            reply_markup=subscription_keyboard()
+        )
+
+
 # ============================================
 # PART 2 COMPLETE - Continue to Part 3
 # ============================================
@@ -1166,6 +1460,18 @@ async def callback_payment_method(callback: types.CallbackQuery):
     product = parts[2]
     
     price_usd = NORMAL_PRICE if product == "normal" else PREMIUM_PRICE
+    # چک کد تخفیف
+    discount_applied = 0
+    if user.id in user_states and "discount_code" in user_states[user.id]:
+        code = user_states[user.id]["discount_code"]
+        validation = await validate_discount_code(code)
+    
+        if validation:
+            discount_percent, _ = validation
+            discount_applied = discount_percent
+            price_usd = price_usd * (100 - discount_percent) / 100
+            logger.info(f"✅ Discount applied: {code} ({discount_percent}%)")
+
     user = callback.from_user
     
     if method == "card":
@@ -2132,10 +2438,34 @@ async def handle_help(message: types.Message):
         "• نامحدود!\n\n"
         "💬 <b>پشتیبانی:</b>\n"
         "• ثبت تیکت\n"
-        "• پاسخ سریع",
+        "• پاسخ سریع"
+        "\n\n📊 <b>گزارش ماهانه:</b>\n"
+        "• /report - مشاهده گزارش فعالیت\n"
+        "• ارسال خودکار اول هر ماه",
+        
         parse_mode="HTML",
         reply_markup=main_menu_keyboard()
     )
+
+@dp.message_handler(commands=["report"])
+async def cmd_report(message: types.Message):
+    """Show monthly report"""
+    user = message.from_user
+    
+    # چک عضویت
+    if not await check_membership_for_all_messages(message):
+        return
+    
+    report = await generate_monthly_report(user.id)
+    
+    if report:
+        await message.reply(report, parse_mode="HTML", reply_markup=main_menu_keyboard())
+    else:
+        await message.reply(
+            "❌ خطا در ساخت گزارش.\n"
+            "لطفاً بعداً تلاش کنید.",
+            reply_markup=main_menu_keyboard()
+        )
 
 @dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_txid_for_withdrawal")
 async def handle_txid_for_withdrawal(message: types.Message):
@@ -2262,6 +2592,104 @@ async def cmd_admin_broadcast(message: types.Message):
                 failed += 1
     
     await message.reply(f"✅ ارسال شد: {success}\n❌ خطا: {failed}")
+
+@dp.message_handler(commands=["createcode"])
+async def cmd_create_discount_code(message: types.Message):
+    """Admin: Create discount code"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    parts = message.text.split()
+    
+    if len(parts) < 4:
+        await message.reply(
+            "❌ <b>استفاده نادرست!</b>\n\n"
+            "فرمت صحیح:\n"
+            "<code>/createcode CODE PERCENT MAX_USES VALID_DAYS</code>\n\n"
+            "مثال:\n"
+            "<code>/createcode SUMMER20 20 100 30</code>\n\n"
+            "توضیحات:\n"
+            "• CODE: کد تخفیف (مثلاً SUMMER20)\n"
+            "• PERCENT: درصد تخفیف (۱-۱۰۰)\n"
+            "• MAX_USES: حداکثر استفاده (۰ = نامحدود)\n"
+            "• VALID_DAYS: اعتبار به روز",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        code = parts[1].upper()
+        discount = int(parts[2])
+        max_uses = int(parts[3])
+        valid_days = int(parts[4]) if len(parts) > 4 else 30
+        
+        if not (1 <= discount <= 100):
+            await message.reply("❌ درصد تخفیف باید بین ۱ تا ۱۰۰ باشد!")
+            return
+        
+        if max_uses < 0:
+            await message.reply("❌ تعداد استفاده نامعتبر!")
+            return
+        
+        success = await create_discount_code(code, discount, max_uses, valid_days, message.from_user.id)
+        
+        if success:
+            await message.reply(
+                f"✅ <b>کد تخفیف ساخته شد!</b>\n\n"
+                f"🎟 کد: <code>{code}</code>\n"
+                f"💰 تخفیف: <b>{discount}%</b>\n"
+                f"👥 حداکثر: {max_uses if max_uses > 0 else 'نامحدود'}\n"
+                f"📅 اعتبار: {valid_days} روز",
+                parse_mode="HTML"
+            )
+        else:
+            await message.reply("❌ کد تکراری است!")
+            
+    except ValueError:
+        await message.reply("❌ مقادیر نامعتبر! فقط عدد وارد کنید.")
+    except Exception as e:
+        await message.reply(f"❌ خطا: {e}")
+
+
+@dp.message_handler(commands=["listcodes"])
+async def cmd_list_discount_codes(message: types.Message):
+    """Admin: List all discount codes"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        rows = await get_all_rows("DiscountCodes")
+        
+        if len(rows) <= 1:
+            await message.reply("📋 هیچ کد تخفیفی وجود ندارد.")
+            return
+        
+        text = "📋 <b>کدهای تخفیف:</b>\n\n"
+        
+        for row in rows[1:]:
+            if not row or len(row) < 8:
+                continue
+            
+            code = row[0]
+            discount = row[1]
+            max_uses = int(row[2]) if row[2] else 0
+            used = row[3]
+            valid_until = parse_iso(row[4])
+            status = row[7]
+            
+            valid_str = valid_until.strftime("%Y/%m/%d") if valid_until else "نامشخص"
+            status_emoji = "✅" if status == "active" else "❌"
+            
+            text += (
+                f"{status_emoji} <code>{code}</code> - {discount}%\n"
+                f"   استفاده: {used}/{max_uses if max_uses > 0 else '∞'} | تا {valid_str}\n\n"
+            )
+        
+        await message.reply(text, parse_mode="HTML")
+        
+    except Exception as e:
+        await message.reply(f"❌ خطا: {e}")
+
 
 # ============================================
 # CALLBACK HANDLERS
@@ -2592,6 +3020,7 @@ async def on_startup(dp):
     
     asyncio.create_task(rebuild_subscription_schedules())
     asyncio.create_task(poll_sheets_auto_process())
+    asyncio.create_task(send_monthly_reports())
     
     logger.info("✅ Bot started!")
 
@@ -2680,6 +3109,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
