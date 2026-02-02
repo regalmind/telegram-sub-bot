@@ -1,4 +1,3 @@
-
 """
 Telegram Subscription Bot - Part 1/3
 Configuration, Google Sheets, and Core Functions
@@ -3463,6 +3462,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
