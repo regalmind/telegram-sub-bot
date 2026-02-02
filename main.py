@@ -1207,7 +1207,24 @@ async def redeem_gift_card(gift_code: str, recipient_id: int, recipient_username
             row[10] = now_iso()
             
             await update_row("GiftCards", idx, row)
-            
+
+            # ✅ مورد ۲: اضافه گیرنده به عنوان معرف سطح ۱ خریدار
+            try:
+                # پیدا کردن یا ساخت یوزر گیرنده
+                recipient_result = await find_user(recipient_id)
+    
+                if recipient_result:
+                    recipient_row_idx, recipient_row = recipient_result
+        
+                    # اگه قبلاً کسی معرفش نکرده
+                    if not recipient_row[5]:  # referred_by خالی باشه
+                        recipient_row[5] = str(buyer_id)  # خریدار رو به عنوان معرف ست کن
+                        await update_row("Users", recipient_row_idx, recipient_row)
+                        logger.info(f"✅ Set {buyer_id} as referrer for gift recipient {recipient_id}")
+    
+            except Exception as e:
+                logger.exception(f"Failed to set referrer for gift: {e}")
+
             logger.info(f"✅ Gift card redeemed: {gift_code} by {recipient_id}")
             return (product, message, buyer_username)
         
@@ -1591,6 +1608,32 @@ async def callback_buy(callback: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == "buy_gift")
 async def callback_buy_gift(callback: types.CallbackQuery):
     """Buy gift card"""
+    user = callback.from_user
+    
+    # ✅ مورد ۱: چک اینکه کاربر قبلاً خرید کرده باشه
+    purchases_rows = await get_all_rows("Purchases")
+    has_purchased = False
+    
+    for row in purchases_rows[1:]:
+        if not row or len(row) < 9:
+            continue
+        
+        # چک اگه این کاربر خرید تایید شده داره
+        if str(row[1]) == str(user.id) and row[8] == "approved":
+            # فقط خریدهای واقعی (نه هدیه) رو حساب کن
+            product = row[3] if len(row) > 3 else ""
+            if not product.startswith("gift_"):
+                has_purchased = True
+                break
+    
+    if not has_purchased:
+        await callback.answer(
+            "⚠️ برای خرید هدیه، ابتدا باید خودتان یک اشتراک خریداری کنید!",
+            show_alert=True
+        )
+        return
+    
+    # ادامه کد عادی
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(
         InlineKeyboardButton(
@@ -1614,6 +1657,7 @@ async def callback_buy_gift(callback: types.CallbackQuery):
         reply_markup=kb
     )
     await callback.answer()
+
 
 
 @dp.callback_query_handler(lambda c: c.data.startswith("gift_"))
@@ -1644,13 +1688,19 @@ async def callback_enter_discount(callback: types.CallbackQuery):
     
     user_states[user.id] = {"state": "awaiting_discount_code"}
     
+    # ✅ مورد ۳: اضافه دکمه بازگشت
+    kb_back = InlineKeyboardMarkup()
+    kb_back.add(InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_buy"))
+    
     await callback.message.edit_text(
         "🎟 <b>کد تخفیف</b>\n\n"
         "لطفاً کد تخفیف خود را وارد کنید:\n\n"
         "مثال: <code>SUMMER20</code>",
-        parse_mode="HTML"
+        parse_mode="HTML",
+        reply_markup=kb_back
     )
     await callback.answer()
+
 
 
 @dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_discount_code")
@@ -3462,6 +3512,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
