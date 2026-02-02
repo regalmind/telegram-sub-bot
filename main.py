@@ -148,6 +148,11 @@ SHEET_DEFINITIONS = {
     "DiscountCodes": [
     "code", "discount_percent", "max_uses", "used_count",
     "valid_until", "created_by", "created_at", "status"
+    ],
+    "GiftCards": [
+    "gift_code", "product", "amount_usd", "buyer_id", 
+    "buyer_username", "recipient_id", "recipient_username",
+    "message", "status", "created_at", "redeemed_at"
     ]
 }
 
@@ -551,6 +556,7 @@ def subscription_keyboard():
             f"💎 اشتراک ویژه - ${PREMIUM_PRICE}",
             callback_data="buy_premium"
         ),
+        InlineKeyboardButton("🎁 خرید هدیه", callback_data="buy_gift"),
         InlineKeyboardButton("🎟 کد تخفیف دارم", callback_data="enter_discount"),
         InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_menu")
     )
@@ -620,6 +626,46 @@ def admin_withdrawal_keyboard(withdrawal_id: str, user_id: int):
         InlineKeyboardButton("❌ رد", callback_data=f"reject_wd_{withdrawal_id}_{user_id}")
     )
     return kb
+
+def social_share_keyboard(product: str = "subscription") -> InlineKeyboardMarkup:
+    """Social media share buttons"""
+    kb = InlineKeyboardMarkup(row_width=2)
+    
+    bot_username = os.getenv("BOT_USERNAME", "YourBot")  # اضافه کن به ENV
+    share_text = f"🎉 من اشتراک {product} گرفتم! شما هم امتحان کنید:"
+    share_url = f"https://t.me/{bot_username}"
+    
+    # URL encode
+    import urllib.parse
+    encoded_text = urllib.parse.quote(share_text)
+    encoded_url = urllib.parse.quote(share_url)
+    
+    kb.add(
+        InlineKeyboardButton(
+            "📱 تلگرام",
+            url=f"https://t.me/share/url?url={encoded_url}&text={encoded_text}"
+        ),
+        InlineKeyboardButton(
+            "💬 واتساپ",
+            url=f"https://wa.me/?text={encoded_text}%20{encoded_url}"
+        )
+    )
+    kb.add(
+        InlineKeyboardButton(
+            "🐦 توییتر",
+            url=f"https://twitter.com/intent/tweet?text={encoded_text}&url={encoded_url}"
+        ),
+        InlineKeyboardButton(
+            "📘 فیسبوک",
+            url=f"https://www.facebook.com/sharer/sharer.php?u={encoded_url}"
+        )
+    )
+    kb.add(
+        InlineKeyboardButton("✅ تمام", callback_data="close_share")
+    )
+    
+    return kb
+
 
 # ============================================
 # REFERRAL SYSTEM
@@ -1092,6 +1138,88 @@ async def use_discount_code(code: str) -> bool:
         return False
 
 
+def generate_gift_code() -> str:
+    """Generate unique gift card code"""
+    return f"GIFT{uuid.uuid4().hex[:8].upper()}"
+
+
+async def create_gift_card(product: str, buyer_id: int, buyer_username: str, message: str = "") -> Optional[str]:
+    """Create a new gift card"""
+    try:
+        gift_code = generate_gift_code()
+        amount_usd = NORMAL_PRICE if product == "normal" else PREMIUM_PRICE
+        
+        await append_row("GiftCards", [
+            gift_code,
+            product,
+            str(amount_usd),
+            str(buyer_id),
+            buyer_username,
+            "",  # recipient_id
+            "",  # recipient_username
+            message,
+            "pending",
+            now_iso(),
+            ""   # redeemed_at
+        ])
+        
+        logger.info(f"✅ Gift card created: {gift_code} by {buyer_id}")
+        return gift_code
+        
+    except Exception as e:
+        logger.exception(f"Error creating gift card: {e}")
+        return None
+
+
+async def redeem_gift_card(gift_code: str, recipient_id: int, recipient_username: str) -> Optional[Tuple[str, str, str]]:
+    """
+    Redeem gift card
+    Returns: (product, message, buyer_username) or None
+    """
+    try:
+        rows = await get_all_rows("GiftCards")
+        
+        for idx, row in enumerate(rows[1:], start=2):
+            if not row or len(row) < 11:
+                continue
+            
+            if row[0] != gift_code:
+                continue
+            
+            # چک وضعیت
+            status = row[8] if len(row) > 8 else ""
+            if status != "pending":
+                return None  # قبلاً استفاده شده
+            
+            # بررسی خریدار = گیرنده نباشه
+            buyer_id = int(row[3]) if len(row) > 3 and row[3] else 0
+            if buyer_id == recipient_id:
+                return None  # نمیشه خودت استفاده کنی!
+            
+            # دریافت اطلاعات
+            product = row[1] if len(row) > 1 else ""
+            message = row[7] if len(row) > 7 else ""
+            buyer_username = row[4] if len(row) > 4 else "کاربر"
+            
+            # آپدیت وضعیت
+            row[6] = recipient_username
+            row[5] = str(recipient_id)
+            row[8] = "redeemed"
+            row[10] = now_iso()
+            
+            await update_row("GiftCards", idx, row)
+            
+            logger.info(f"✅ Gift card redeemed: {gift_code} by {recipient_id}")
+            return (product, message, buyer_username)
+        
+        return None
+        
+    except Exception as e:
+        logger.exception(f"Error redeeming gift card: {e}")
+        return None
+
+
+
 # ============================================
 # COMMAND HANDLERS
 # ============================================
@@ -1100,7 +1228,62 @@ async def cmd_start(message: types.Message):
     """Start command"""
     user = message.from_user
     args = message.get_args()
+
+    # چک اگر لینک هدیه است
+    args = message.get_args()
+    if args and args.startswith("gift_"):
+        gift_code = args.replace("gift_", "")
     
+        # Redeem gift
+        result = await redeem_gift_card(gift_code, user.id, user.username or "")
+    
+        if result:
+            product, gift_message, buyer_username = result
+        
+            # فعال‌سازی اشتراک
+            await activate_subscription(user.id, user.username or "", product, "gift")
+        
+            # پیام به گیرنده
+            await message.reply(
+                f"🎊 <b>تبریک! هدیه دریافت شد!</b>\n\n"
+                f"🎁 از طرف: @{buyer_username}\n"
+                f"💎 اشتراک: {'ویژه' if product == 'premium' else 'معمولی'}\n"
+                f"{'💬 پیام: ' + gift_message if gift_message else ''}\n\n"
+                f"✅ اشتراک شما فعال شد!\n"
+                f"📅 مدت: ۶ ماه",
+                parse_mode="HTML",
+                reply_markup=main_menu_keyboard()
+            )
+        
+            # پیام به خریدار
+            buyer_id = None
+            rows = await get_all_rows("GiftCards")
+            for row in rows[1:]:
+                if row and row[0] == gift_code:
+                    buyer_id = int(row[3]) if len(row) > 3 and row[3] else None
+                    break
+        
+            if buyer_id:
+                try:
+                    await bot.send_message(
+                        buyer_id,
+                        f"🎉 <b>هدیه شما دریافت شد!</b>\n\n"
+                        f"👤 توسط: @{user.username or user.full_name}\n"
+                        f"⏰ در: {datetime.utcnow().strftime('%Y/%m/%d %H:%M')}",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+        
+            return
+        else:
+            await message.reply(
+                "❌ <b>کد هدیه نامعتبر!</b>\n\n"
+                "این کد قبلاً استفاده شده یا اشتباه است.",
+                parse_mode="HTML"
+            )
+            return
+
     # ✅ اول از همه چک عضویت کانال
     is_member, missing = await check_required_channels(user.id)
     
@@ -1222,6 +1405,22 @@ async def callback_check_membership(callback: types.CallbackQuery):
         await callback.answer("❌ هنوز عضو نشده‌اید!", show_alert=True)
         kb = channel_membership_keyboard(missing)
         await callback.message.edit_reply_markup(reply_markup=kb)
+
+@dp.callback_query_handler(lambda c: c.data == "close_share")
+async def callback_close_share(callback: types.CallbackQuery):
+    """Close share window"""
+    try:
+        await callback.message.delete()
+    except:
+        pass
+    
+    await bot.send_message(
+        callback.from_user.id,
+        "از منوی زیر استفاده کنید:",
+        reply_markup=main_menu_keyboard()
+    )
+    await callback.answer()
+
 
 # ============================================
 # EMAIL HANDLERS
@@ -1390,6 +1589,55 @@ async def callback_buy(callback: types.CallbackQuery):
     )
     await callback.answer()
 
+@dp.callback_query_handler(lambda c: c.data == "buy_gift")
+async def callback_buy_gift(callback: types.CallbackQuery):
+    """Buy gift card"""
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton(
+            f"🎁 هدیه معمولی - ${NORMAL_PRICE}",
+            callback_data="gift_normal"
+        ),
+        InlineKeyboardButton(
+            f"💎 هدیه ویژه - ${PREMIUM_PRICE}",
+            callback_data="gift_premium"
+        ),
+        InlineKeyboardButton("🔙 بازگشت", callback_data="back_to_buy")
+    )
+    
+    await callback.message.edit_text(
+        "🎁 <b>خرید هدیه</b>\n\n"
+        "اشتراک را برای دوست خود هدیه بدهید!\n\n"
+        f"⭐️ معمولی: <b>${NORMAL_PRICE}</b>\n"
+        f"💎 ویژه: <b>${PREMIUM_PRICE}</b>\n\n"
+        "نوع هدیه را انتخاب کنید:",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data.startswith("gift_"))
+async def callback_gift_type(callback: types.CallbackQuery):
+    """Gift type selected"""
+    user = callback.from_user
+    product = callback.data.replace("gift_", "")  # normal or premium
+    
+    user_states[user.id] = {
+        "state": "awaiting_gift_message",
+        "gift_product": product
+    }
+    
+    await callback.message.edit_text(
+        "🎁 <b>پیام هدیه</b>\n\n"
+        "یک پیام برای دریافت‌کننده بنویسید:\n\n"
+        "مثال: <code>تولدت مبارک! 🎉</code>\n\n"
+        "یا /skip برای رد کردن",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
 @dp.callback_query_handler(lambda c: c.data == "enter_discount")
 async def callback_enter_discount(callback: types.CallbackQuery):
     """Enter discount code"""
@@ -1441,6 +1689,37 @@ async def handle_discount_code_input(message: types.Message):
         )
 
 
+@dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_gift_message")
+async def handle_gift_message(message: types.Message):
+    """Handle gift message input"""
+    user = message.from_user
+    state = user_states.get(user.id, {})
+    product = state.get("gift_product", "normal")
+    
+    gift_message = "" if message.text == "/skip" else message.text.strip()
+    
+    # انتخاب روش پرداخت
+    price_usd = NORMAL_PRICE if product == "normal" else PREMIUM_PRICE
+    
+    user_states[user.id] = {
+        "state": "awaiting_gift_payment",
+        "gift_product": product,
+        "gift_message": gift_message
+    }
+    
+    kb = payment_method_keyboard(f"gift_{product}")
+    
+    await message.reply(
+        f"💳 <b>پرداخت هدیه</b>\n\n"
+        f"💰 مبلغ: <b>${price_usd}</b>\n"
+        f"🎁 نوع: {'معمولی' if product == 'normal' else 'ویژه'}\n"
+        f"💬 پیام: {gift_message if gift_message else '(بدون پیام)'}\n\n"
+        "روش پرداخت را انتخاب کنید:",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
 # ============================================
 # PART 2 COMPLETE - Continue to Part 3
 # ============================================
@@ -1459,6 +1738,15 @@ async def callback_payment_method(callback: types.CallbackQuery):
     method = parts[1]
     product = parts[2]
     
+    # چک اگر هدیه است
+    is_gift = product.startswith("gift_")
+    if is_gift:
+        actual_product = product.replace("gift_", "")
+        price_usd = NORMAL_PRICE if actual_product == "normal" else PREMIUM_PRICE
+    else:
+        actual_product = product
+        price_usd = NORMAL_PRICE if product == "normal" else PREMIUM_PRICE
+   
     price_usd = NORMAL_PRICE if product == "normal" else PREMIUM_PRICE
     # چک کد تخفیف
     discount_applied = 0
@@ -1480,7 +1768,8 @@ async def callback_payment_method(callback: types.CallbackQuery):
         purchase_id = generate_purchase_id()
         
         await append_row("Purchases", [
-            purchase_id, str(user.id), user.username or "", product,
+            purchase_id, str(user.id), user.username or "", 
+            product,  # gift_normal یا gift_premium یا normal یا premium
             str(price_usd), str(price_irr), "card", "", "pending",
             now_iso(), "", "", ""
         ])
@@ -2293,9 +2582,6 @@ async def handle_referral(message: types.Message):
     if not await check_membership_for_all_messages(message):
         return
     
-    # ... بقیه کد
-
-    
     # Check if user has active subscription
     subscription = await get_active_subscription(user.id)
     
@@ -2332,6 +2618,30 @@ async def handle_referral(message: types.Message):
     bot_username = (await bot.get_me()).username
     referral_link = f"https://t.me/{bot_username}?start={referral_code}"
     
+    # ✅ آپدیت #19: اضافه دکمه اشتراک‌گذاری لینک معرف
+    import urllib.parse
+    share_text = f"🎁 از این لینک عضو شو و من هم پورسانت میگیرم!"
+    encoded_text = urllib.parse.quote(share_text)
+    encoded_link = urllib.parse.quote(referral_link)
+    
+    kb_share = InlineKeyboardMarkup(row_width=2)
+    kb_share.add(
+        InlineKeyboardButton(
+            "📱 اشتراک در تلگرام",
+            url=f"https://t.me/share/url?url={encoded_link}&text={encoded_text}"
+        ),
+        InlineKeyboardButton(
+            "💬 اشتراک در واتساپ",
+            url=f"https://wa.me/?text={encoded_text}%20{encoded_link}"
+        )
+    )
+    kb_share.add(
+        InlineKeyboardButton(
+            "🐦 اشتراک در توییتر",
+            url=f"https://twitter.com/intent/tweet?text={encoded_text}&url={encoded_link}"
+        )
+    )
+    
     await message.reply(
         f"🎁 <b>دعوت دوستان</b>\n\n"
         f"🔗 <b>لینک:</b>\n<code>{referral_link}</code>\n\n"
@@ -2345,10 +2655,12 @@ async def handle_referral(message: types.Message):
         f"• از لینک بالا دعوت کنید\n"
         f"• هر خرید = پورسانت\n"
         f"• سطح 1: 8%\n"
-        f"• سطح 2: 12%",
+        f"• سطح 2: 12%\n\n"
+        f"📢 لینک خود را به اشتراک بگذارید:",
         parse_mode="HTML",
-        reply_markup=main_menu_keyboard()
+        reply_markup=kb_share
     )
+
 
 
 # ============================================
@@ -2783,31 +3095,73 @@ async def poll_sheets_auto_process():
                     if admin_action == "approve":
                         logger.info(f"✅ Auto-approving {purchase_id} for user {telegram_id}")
                         
-                        try:
-                            await activate_subscription(telegram_id, username, product, payment_method)
-                            await process_referral_commission(purchase_id, telegram_id, amount_usd)
-                        except Exception as e:
-                            logger.exception(f"Failed to activate: {e}")
+                        # ✅ آپدیت #13: چک اگر خرید هدیه است
+                        is_gift = product.startswith("gift_")
                         
-                        try:
-                            result = await find_user(telegram_id)
-                            if result:
-                                _, user_row = result
-                                referral_code = user_row[4] if len(user_row) > 4 else ""
+                        if is_gift:
+                            # خرید هدیه - ساخت گیفت کارت
+                            actual_product = product.replace("gift_", "")
+                            
+                            # دریافت پیام هدیه از user_states
+                            gift_message = ""
+                            if telegram_id in user_states:
+                                gift_message = user_states[telegram_id].get("gift_message", "")
+                            
+                            # ساخت گیفت کارت
+                            gift_code = await create_gift_card(actual_product, telegram_id, username, gift_message)
+                            
+                            if gift_code:
+                                bot_username = (await bot.get_me()).username
+                                gift_link = f"https://t.me/{bot_username}?start=gift_{gift_code}"
                                 
-                                await bot.send_message(
-                                    telegram_id,
-                                    f"🎉 <b>پرداخت تایید شد!</b>\n\n"
-                                    f"✅ اشتراک فعال شد\n"
-                                    f"📅 مدت: ۶ ماه\n\n"
-                                    f"🎁 کد معرف:\n<code>{referral_code}</code>\n\n"
-                                    f"💡 با دعوت دوستان پورسانت کسب کنید!",
-                                    parse_mode="HTML",
-                                    reply_markup=main_menu_keyboard()
-                                )
-                                logger.info(f"✅ Sent approval to {telegram_id}")
-                        except Exception as e:
-                            logger.exception(f"Failed to send approval: {e}")
+                                try:
+                                    await bot.send_message(
+                                        telegram_id,
+                                        f"🎁 <b>هدیه شما آماده شد!</b>\n\n"
+                                        f"🔗 <b>لینک هدیه:</b>\n<code>{gift_link}</code>\n\n"
+                                        f"💡 این لینک را برای دوست خود ارسال کنید.\n"
+                                        f"او با کلیک روی لینک، اشتراک فعال می‌شود!",
+                                        parse_mode="HTML",
+                                        reply_markup=main_menu_keyboard()
+                                    )
+                                    logger.info(f"✅ Sent gift card to {telegram_id}")
+                                except Exception as e:
+                                    logger.exception(f"Failed to send gift card: {e}")
+                            
+                            # حذف state
+                            user_states.pop(telegram_id, None)
+                        
+                        else:
+                            # خرید عادی - فعال‌سازی مستقیم
+                            try:
+                                await activate_subscription(telegram_id, username, product, payment_method)
+                                await process_referral_commission(purchase_id, telegram_id, amount_usd)
+                            except Exception as e:
+                                logger.exception(f"Failed to activate: {e}")
+                            
+                            try:
+                                result = await find_user(telegram_id)
+                                if result:
+                                    _, user_row = result
+                                    referral_code = user_row[4] if len(user_row) > 4 else ""
+                                    
+                                    # ✅ آپدیت #19: اضافه دکمه‌های اشتراک‌گذاری
+                                    kb_share = social_share_keyboard("ویژه" if product == "premium" else "معمولی")
+                                    
+                                    await bot.send_message(
+                                        telegram_id,
+                                        f"🎉 <b>پرداخت تایید شد!</b>\n\n"
+                                        f"✅ اشتراک فعال شد\n"
+                                        f"📅 مدت: ۶ ماه\n\n"
+                                        f"🎁 کد معرف:\n<code>{referral_code}</code>\n\n"
+                                        f"💡 با دعوت دوستان پورسانت کسب کنید!\n\n"
+                                        f"📢 این خبر خوب را با دوستان به اشتراک بگذارید:",
+                                        parse_mode="HTML",
+                                        reply_markup=kb_share
+                                    )
+                                    logger.info(f"✅ Sent approval to {telegram_id}")
+                            except Exception as e:
+                                logger.exception(f"Failed to send approval: {e}")
                         
                         # Auto-fill columns
                         row[admin_action_idx] = ""  # Clear action
@@ -3109,6 +3463,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
