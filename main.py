@@ -1234,6 +1234,192 @@ async def redeem_gift_card(gift_code: str, recipient_id: int, recipient_username
         logger.exception(f"Error redeeming gift card: {e}")
         return None
 
+async def calculate_dashboard_stats() -> Dict[str, Any]:
+    """Calculate comprehensive dashboard statistics"""
+    try:
+        stats = {}
+        now = datetime.utcnow()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = today_start - timedelta(days=7)
+        
+        # ============ Users Stats ============
+        users_rows = await get_all_rows("Users")
+        total_users = len(users_rows) - 1  # منهای header
+        
+        users_today = 0
+        users_week = 0
+        
+        for row in users_rows[1:]:
+            if not row or len(row) < 9:
+                continue
+            
+            created = parse_iso(row[8]) if len(row) > 8 else None
+            if created:
+                if created >= today_start:
+                    users_today += 1
+                if created >= week_start:
+                    users_week += 1
+        
+        stats['users'] = {
+            'total': total_users,
+            'today': users_today,
+            'week': users_week
+        }
+        
+        # ============ Subscriptions Stats ============
+        subs_rows = await get_all_rows("Subscriptions")
+        active_subs = 0
+        expired_subs = 0
+        normal_subs = 0
+        premium_subs = 0
+        
+        for row in subs_rows[1:]:
+            if not row or len(row) < 6:
+                continue
+            
+            status = row[3] if len(row) > 3 else ""
+            product = row[2] if len(row) > 2 else ""
+            
+            if status == "active":
+                active_subs += 1
+                if product == "premium":
+                    premium_subs += 1
+                else:
+                    normal_subs += 1
+            elif status == "expired":
+                expired_subs += 1
+        
+        stats['subscriptions'] = {
+            'active': active_subs,
+            'expired': expired_subs,
+            'normal': normal_subs,
+            'premium': premium_subs
+        }
+        
+        # ============ Revenue Stats ============
+        purchases_rows = await get_all_rows("Purchases")
+        total_revenue = 0.0
+        revenue_today = 0.0
+        revenue_week = 0.0
+        approved_count = 0
+        pending_count = 0
+        rejected_count = 0
+        
+        daily_revenue = {}  # برای پیدا کردن بهترین روز
+        hourly_revenue = {}  # برای پیدا کردن بهترین ساعت
+        
+        for row in purchases_rows[1:]:
+            if not row or len(row) < 11:
+                continue
+            
+            status = row[8] if len(row) > 8 else ""
+            amount = float(row[4]) if len(row) > 4 and row[4] else 0
+            
+            if status == "approved":
+                approved_count += 1
+                total_revenue += amount
+                
+                # تاریخ تایید
+                approved_at = parse_iso(row[10]) if len(row) > 10 else None
+                if approved_at:
+                    if approved_at >= today_start:
+                        revenue_today += amount
+                    if approved_at >= week_start:
+                        revenue_week += amount
+                    
+                    # آمار روزانه
+                    day_name = approved_at.strftime("%A")  # Monday, Tuesday, ...
+                    daily_revenue[day_name] = daily_revenue.get(day_name, 0) + amount
+                    
+                    # آمار ساعتی
+                    hour = approved_at.hour
+                    hourly_revenue[hour] = hourly_revenue.get(hour, 0) + amount
+            
+            elif status == "pending":
+                pending_count += 1
+            elif status == "rejected":
+                rejected_count += 1
+        
+        avg_purchase = total_revenue / approved_count if approved_count > 0 else 0
+        
+        # بهترین روز
+        best_day = max(daily_revenue.items(), key=lambda x: x[1])[0] if daily_revenue else "N/A"
+        
+        # بهترین ساعت
+        if hourly_revenue:
+            best_hour = max(hourly_revenue.items(), key=lambda x: x[1])[0]
+            best_hour_range = f"{best_hour:02d}:00-{(best_hour+1):02d}:00"
+        else:
+            best_hour_range = "N/A"
+        
+        stats['revenue'] = {
+            'total': total_revenue,
+            'today': revenue_today,
+            'week': revenue_week,
+            'avg_purchase': avg_purchase,
+            'approved': approved_count,
+            'pending': pending_count,
+            'rejected': rejected_count,
+            'best_day': best_day,
+            'best_hour': best_hour_range
+        }
+        
+        # ============ Conversion Rates ============
+        # تست → خرید
+        test_purchases = sum(1 for row in purchases_rows[1:] if row and len(row) > 3 and row[3] == "test")
+        test_to_purchase_rate = (approved_count / test_purchases * 100) if test_purchases > 0 else 0
+        
+        # معمولی → ویژه
+        normal_to_premium_rate = (premium_subs / (normal_subs + premium_subs) * 100) if (normal_subs + premium_subs) > 0 else 0
+        
+        stats['conversion'] = {
+            'test_to_purchase': test_to_purchase_rate,
+            'normal_to_premium': normal_to_premium_rate
+        }
+        
+        # ============ Referrals Stats ============
+        referrals_rows = await get_all_rows("Referrals")
+        total_commissions = 0.0
+        
+        for row in referrals_rows[1:]:
+            if row and len(row) > 3:
+                try:
+                    total_commissions += float(row[3])
+                except:
+                    pass
+        
+        stats['referrals'] = {
+            'total_count': len(referrals_rows) - 1,
+            'total_commissions': total_commissions
+        }
+        
+        # ============ Withdrawals Stats ============
+        withdrawals_rows = await get_all_rows("Withdrawals")
+        total_withdrawn = 0.0
+        pending_withdrawals = 0
+        
+        for row in withdrawals_rows[1:]:
+            if not row or len(row) < 7:
+                continue
+            
+            status = row[6] if len(row) > 6 else ""
+            amount = float(row[2]) if len(row) > 2 and row[2] else 0
+            
+            if status == "completed":
+                total_withdrawn += amount
+            elif status == "pending":
+                pending_withdrawals += 1
+        
+        stats['withdrawals'] = {
+            'total': total_withdrawn,
+            'pending': pending_withdrawals
+        }
+        
+        return stats
+        
+    except Exception as e:
+        logger.exception(f"Error calculating dashboard stats: {e}")
+        return {}
 
 
 # ============================================
@@ -3051,6 +3237,68 @@ async def cmd_list_discount_codes(message: types.Message):
     except Exception as e:
         await message.reply(f"❌ خطا: {e}")
 
+@dp.message_handler(commands=["dashboard"])
+async def cmd_admin_dashboard(message: types.Message):
+    """Admin: Comprehensive dashboard"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    await message.reply("⏳ در حال محاسبه آمار...")
+    
+    stats = await calculate_dashboard_stats()
+    
+    if not stats:
+        await message.reply("❌ خطا در محاسبه آمار.")
+        return
+    
+    # ساخت پیام
+    dashboard_text = (
+        "📊 <b>داشبورد مدیریت</b>\n\n"
+        
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "👥 <b>کاربران:</b>\n"
+        f"   • کل: <b>{stats['users']['total']}</b> نفر\n"
+        f"   • امروز: <b>+{stats['users']['today']}</b> نفر\n"
+        f"   • هفته: <b>+{stats['users']['week']}</b> نفر\n\n"
+        
+        "📅 <b>اشتراک‌ها:</b>\n"
+        f"   • فعال: <b>{stats['subscriptions']['active']}</b>\n"
+        f"   • منقضی: <b>{stats['subscriptions']['expired']}</b>\n"
+        f"   • معمولی: <b>{stats['subscriptions']['normal']}</b>\n"
+        f"   • ویژه: <b>{stats['subscriptions']['premium']}</b>\n\n"
+        
+        "💰 <b>درآمد:</b>\n"
+        f"   • کل: <b>${stats['revenue']['total']:.2f}</b>\n"
+        f"   • امروز: <b>${stats['revenue']['today']:.2f}</b>\n"
+        f"   • هفته: <b>${stats['revenue']['week']:.2f}</b>\n"
+        f"   • میانگین هر خرید: <b>${stats['revenue']['avg_purchase']:.2f}</b>\n\n"
+        
+        "🛒 <b>سفارشات:</b>\n"
+        f"   • تایید شده: <b>{stats['revenue']['approved']}</b>\n"
+        f"   • در انتظار: <b>{stats['revenue']['pending']}</b>\n"
+        f"   • رد شده: <b>{stats['revenue']['rejected']}</b>\n\n"
+        
+        "📈 <b>نرخ تبدیل:</b>\n"
+        f"   • تست → خرید: <b>{stats['conversion']['test_to_purchase']:.1f}%</b>\n"
+        f"   • معمولی → ویژه: <b>{stats['conversion']['normal_to_premium']:.1f}%</b>\n\n"
+        
+        "🎁 <b>معرفی:</b>\n"
+        f"   • تعداد: <b>{stats['referrals']['total_count']}</b>\n"
+        f"   • کل پورسانت: <b>${stats['referrals']['total_commissions']:.2f}</b>\n\n"
+        
+        "💸 <b>برداشت‌ها:</b>\n"
+        f"   • پرداخت شده: <b>${stats['withdrawals']['total']:.2f}</b>\n"
+        f"   • در انتظار: <b>{stats['withdrawals']['pending']}</b>\n\n"
+        
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🔥 <b>بهترین عملکرد:</b>\n"
+        f"   • روز: <b>{stats['revenue']['best_day']}</b>\n"
+        f"   • ساعت: <b>{stats['revenue']['best_hour']}</b>\n"
+    )
+    
+    await message.reply(dashboard_text, parse_mode="HTML")
+
+
 
 # ============================================
 # CALLBACK HANDLERS
@@ -3512,6 +3760,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
