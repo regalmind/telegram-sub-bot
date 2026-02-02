@@ -152,6 +152,11 @@ SHEET_DEFINITIONS = {
     "gift_code", "product", "amount_usd", "buyer_id", 
     "buyer_username", "recipient_id", "recipient_username",
     "message", "status", "created_at", "redeemed_at"
+    ],
+    "ActivityLog": [
+    "telegram_id", "username", "activity_type", 
+    "description", "amount_usd", "related_id", 
+    "timestamp"
     ]
 }
 
@@ -1421,6 +1426,56 @@ async def calculate_dashboard_stats() -> Dict[str, Any]:
         logger.exception(f"Error calculating dashboard stats: {e}")
         return {}
 
+async def log_activity(telegram_id: int, username: str, activity_type: str, description: str, amount_usd: float = 0, related_id: str = ""):
+    """Log user activity"""
+    try:
+        await append_row("ActivityLog", [
+            str(telegram_id),
+            username,
+            activity_type,
+            description,
+            str(amount_usd),
+            related_id,
+            now_iso()
+        ])
+        
+        logger.info(f"📝 Activity logged: {telegram_id} - {activity_type}")
+        
+    except Exception as e:
+        logger.exception(f"Error logging activity: {e}")
+
+
+async def get_user_activity_log(telegram_id: int, limit: int = 20) -> List[Dict[str, Any]]:
+    """Get user's recent activity log"""
+    try:
+        rows = await get_all_rows("ActivityLog")
+        
+        activities = []
+        
+        for row in rows[1:]:
+            if not row or len(row) < 7:
+                continue
+            
+            if str(row[0]) != str(telegram_id):
+                continue
+            
+            activities.append({
+                'type': row[2],
+                'description': row[3],
+                'amount': float(row[4]) if row[4] else 0,
+                'related_id': row[5],
+                'timestamp': row[6]
+            })
+        
+        # مرتب‌سازی بر اساس زمان (جدیدترین اول)
+        activities.sort(key=lambda x: x['timestamp'], reverse=True)
+        
+        return activities[:limit]
+        
+    except Exception as e:
+        logger.exception(f"Error getting activity log: {e}")
+        return []
+
 
 # ============================================
 # COMMAND HANDLERS
@@ -1552,6 +1607,15 @@ async def cmd_start(message: types.Message):
             parse_mode="HTML"
         )
         return
+        
+        # لاگ ورود
+        await log_activity(
+            user.id,
+            user.username or user.full_name,
+            "login",
+            "ورود به ربات"
+        )
+
     
     # ✅ نمایش منوی اصلی
     subscription = await get_active_subscription(user.id)
@@ -3441,7 +3505,17 @@ async def poll_sheets_auto_process():
                                 if result:
                                     _, user_row = result
                                     referral_code = user_row[4] if len(user_row) > 4 else ""
-                                    
+
+                                    # لاگ خرید
+                                await log_activity(
+                                    telegram_id,
+                                    username,
+                                    "purchase",
+                                    f"خرید اشتراک {'ویژه' if product == 'premium' else 'معمولی'}",
+                                    amount_usd,
+                                    purchase_id
+                                )
+
                                     # ✅ آپدیت #19: اضافه دکمه‌های اشتراک‌گذاری
                                     kb_share = social_share_keyboard("ویژه" if product == "premium" else "معمولی")
                                     
@@ -3760,6 +3834,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
