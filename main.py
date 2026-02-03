@@ -1615,7 +1615,6 @@ async def cmd_start(message: types.Message):
     args = message.get_args()
 
     # چک اگر لینک هدیه است
-    args = message.get_args()
     if args and args.startswith("gift_"):
         gift_code = args.replace("gift_", "")
     
@@ -1736,7 +1735,7 @@ async def cmd_start(message: types.Message):
         )
         return
 
-    # ✅ تشخیص ادمین و انتخاب منوی مناسب
+    # ✅ تشخیص ادمین و تعیین منو و پیام
     if is_admin(user.id):
         menu_kb = admin_menu_keyboard()
         greeting = f"👋 <b>سلام {user.full_name}!</b>\n\n🔐 <b>پنل ادمین</b>"
@@ -1763,10 +1762,15 @@ async def cmd_start(message: types.Message):
             reply_markup=menu_kb
         )
     else:
+        # فیکس: پیام رو قبل از f-string بساز (جلوگیری از syntax error)
+        if is_admin(user.id):
+            status_msg = "از منوی مدیریت استفاده کنید:"
+        else:
+            status_msg = "شما اشتراک فعالی ندارید.\n\n🆓 تست رایگان یا 💎 خرید اشتراک"
+        
         await send_and_record(
             user.id,
-            f"{greeting}\n\n"
-            f"{'از منوی مدیریت استفاده کنید:' if is_admin(user.id) else 'شما اشتراک فعالی ندارید.\n\n🆓 تست رایگان یا 💎 خرید اشتراک'}",
+            f"{greeting}\n\n{status_msg}",
             parse_mode="HTML",
             reply_markup=menu_kb
         )
@@ -4946,6 +4950,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
