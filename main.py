@@ -3331,31 +3331,485 @@ async def cmd_admin_stats(message: types.Message):
         parse_mode="HTML"
     )
 
-@dp.message_handler(commands=["broadcast"])
-async def cmd_admin_broadcast(message: types.Message):
-    """Admin broadcast"""
+# ============================================
+# ADMIN MESSAGING SYSTEM - نسخه نهایی
+# جای دادن: جایی که قبلاً /broadcast بود حذف کنید
+# و این کل بلوک رو بجاش بذارید
+# ============================================
+
+# ─── دستور /msg — پیام به یه نفر خاص ───
+@dp.message_handler(commands=["msg"])
+async def cmd_admin_msg(message: types.Message):
+    """Admin: پیام به یه کاربر خاص با ID"""
     if not is_admin(message.from_user.id):
         return
-    
-    text = message.text.replace("/broadcast", "").strip()
-    if not text:
-        await message.reply("استفاده: /broadcast پیام شما")
+
+    parts = message.text.split(maxsplit=2)
+
+    if len(parts) < 3:
+        await message.reply(
+            "📝 <b>پیام به کاربر خاص</b>\n\n"
+            "فرمت:\n"
+            "<code>/msg USER_ID پیام شما</code>\n\n"
+            "مثال:\n"
+            "<code>/msg 123456789 سلام، حساب شما بررسی شد.</code>",
+            parse_mode="HTML"
+        )
         return
-    
+
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await message.reply("❌ ID نامعتبر! فقط عدد وارد کنید.")
+        return
+
+    text = parts[2]
+
+    # چک کاربر وجود داره یا نه
+    target = await find_user(target_id)
+    if not target:
+        user_states[message.from_user.id] = {
+            "state": "confirm_msg_unknown_user",
+            "target_id": target_id,
+            "text": text
+        }
+        await message.reply(
+            f"⚠️ کاربری با ID <code>{target_id}</code> در سیستم پیدا نشد.\n\n"
+            "میخواید بنوشته بشه؟ (بله / نه)",
+            parse_mode="HTML"
+        )
+        return
+
+    try:
+        await bot.send_message(target_id, text, parse_mode="HTML")
+        _, target_row = target
+        target_name = target_row[2] if len(target_row) > 2 else "نامشخص"
+        target_username = target_row[1] if len(target_row) > 1 else ""
+        await message.reply(
+            f"✅ <b>پیام ارسال شد</b>\n\n"
+            f"👤 به: {target_name} (@{target_username or 'ندارد'})\n"
+            f"🆔 ID: <code>{target_id}</code>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await message.reply(f"❌ خطا در ارسال: {e}")
+
+
+# ─── تایید پیام به کاربر ناشناس ───
+@dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "confirm_msg_unknown_user")
+async def handle_confirm_msg_unknown(message: types.Message):
+    """تایید ارسال پیام به کاربر ناشناس"""
+    if not is_admin(message.from_user.id):
+        return
+
+    state = user_states.pop(message.from_user.id, {})
+    target_id = state.get("target_id")
+    text = state.get("text")
+
+    if message.text.strip().lower() in ["بله", "آره", "yes", "y"]:
+        try:
+            await bot.send_message(target_id, text, parse_mode="HTML")
+            await message.reply(f"✅ پیام به <code>{target_id}</code> ارسال شد.", parse_mode="HTML")
+        except Exception as e:
+            await message.reply(f"❌ خطا: {e}")
+    else:
+        await message.reply("❌ لغو شد.")
+
+
+# ─── دستور /broadcast — پیام به کل کاربران (با تایید) ───
+@dp.message_handler(commands=["broadcast"])
+async def cmd_admin_broadcast(message: types.Message):
+    """Admin broadcast to all users - با مرحله تایید"""
+    if not is_admin(message.from_user.id):
+        return
+
+    text = message.text.replace("/broadcast", "", 1).strip()
+    if not text:
+        await message.reply(
+            "📝 <b>پیام به کل کاربران</b>\n\n"
+            "فرمت:\n"
+            "<code>/broadcast پیام شما</code>\n\n"
+            "پیام شما به <b>تمام</b> کاربران ارسال میشه.\n"
+            "قبل از ارسال یه مرحله تایید داره.",
+            parse_mode="HTML"
+        )
+        return
+
+    users = await get_all_rows("Users")
+    total = len(users) - 1
+
+    user_states[message.from_user.id] = {
+        "state": "confirm_broadcast",
+        "text": text
+    }
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ بله، بفرست", callback_data="confirm_broadcast_yes"),
+        InlineKeyboardButton("❌ لغو", callback_data="confirm_broadcast_no")
+    )
+
+    await message.reply(
+        f"⚠️ <b>تایید ارسال</b>\n\n"
+        f"👥 تعداد کاربران: <b>{total}</b> نفر\n\n"
+        f"📝 پیام:\n{text}\n\n"
+        f"مطمئنید؟",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "confirm_broadcast_yes")
+async def callback_confirm_broadcast(callback: types.CallbackQuery):
+    """تایید و ارسال broadcast"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️ شما ادمین نیستید!", show_alert=True)
+        return
+
+    state = user_states.pop(callback.from_user.id, {})
+    text = state.get("text", "")
+
+    if not text:
+        await callback.answer("❌ پیام یافت نشد!", show_alert=True)
+        return
+
+    await callback.message.edit_text("⏳ <b>در حال ارسال به کل کاربران...</b>", parse_mode="HTML")
+
     users = await get_all_rows("Users")
     success = 0
     failed = 0
-    
+    failed_ids = []
+
     for row in users[1:]:
-        if row:
-            try:
-                await bot.send_message(int(row[0]), text, parse_mode="HTML")
-                success += 1
-                await asyncio.sleep(0.05)
-            except:
-                failed += 1
-    
-    await message.reply(f"✅ ارسال شد: {success}\n❌ خطا: {failed}")
+        if not row or not row[0]:
+            continue
+        try:
+            await bot.send_message(int(row[0]), text, parse_mode="HTML")
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            failed += 1
+            failed_ids.append(row[0])
+
+    report = (
+        f"✅ <b>Broadcast تمام شد</b>\n\n"
+        f"📤 ارسال شد: <b>{success}</b> نفر\n"
+        f"❌ خطا: <b>{failed}</b> نفر\n"
+    )
+    if failed_ids and len(failed_ids) <= 10:
+        report += f"\n🆔 خطا دار: {', '.join(failed_ids)}"
+
+    await callback.message.edit_text(report, parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "confirm_broadcast_no")
+async def callback_cancel_broadcast(callback: types.CallbackQuery):
+    """لغو broadcast"""
+    user_states.pop(callback.from_user.id, None)
+    await callback.message.edit_text("❌ <b>لغو شد.</b>", parse_mode="HTML")
+    await callback.answer()
+
+
+# ─── دستور /msklist — پیام به گروه فیلتر شده ───
+@dp.message_handler(commands=["msklist"])
+async def cmd_admin_msklist(message: types.Message):
+    """Admin: منوی پیام به گروه فیلتر شده"""
+    if not is_admin(message.from_user.id):
+        return
+
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("✅ فعال (اشتراک دارن)", callback_data="msklist_active"),
+        InlineKeyboardButton("⏰ منقضی (اشتراک تموم شده)", callback_data="msklist_expired"),
+        InlineKeyboardButton("🎁 معرف کرده (پورسانت گرفتن)", callback_data="msklist_referrers"),
+        InlineKeyboardButton("🎟 هدیه خریده", callback_data="msklist_gift_buyers"),
+        InlineKeyboardButton("🌟 بوست فعال", callback_data="msklist_boosted"),
+        InlineKeyboardButton("📝 لیست دستی ID ها", callback_data="msklist_manual"),
+    )
+
+    await message.reply(
+        "📋 <b>پیام به گروه</b>\n\n"
+        "گروه مورد نظر رو انتخاب کنید:",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+# ─── تابع فیلتر کاربران ───
+async def get_filtered_users(filter_type: str) -> list:
+    """
+    فیلتر کاربران بر اساس نوع انتخاب شده
+    Returns: لیست telegram_id های فیلتر شده
+    """
+    users_rows = await get_all_rows("Users")
+    subs_rows = await get_all_rows("Subscriptions")
+    referrals_rows = await get_all_rows("Referrals")
+    purchases_rows = await get_all_rows("Purchases")
+    now = datetime.utcnow()
+
+    filtered = []
+
+    if filter_type == "active":
+        # اشتراک فعال و غیر منقضی
+        for row in subs_rows[1:]:
+            if not row or len(row) < 6:
+                continue
+            if row[3] == "active":
+                expires = parse_iso(row[5]) if len(row) > 5 else None
+                if expires and expires > now:
+                    filtered.append(row[0])
+
+    elif filter_type == "expired":
+        # قبلا sub داشتن ولی الان فعال نیستن
+        active_ids = set()
+        for row in subs_rows[1:]:
+            if not row or len(row) < 6:
+                continue
+            if row[3] == "active":
+                expires = parse_iso(row[5]) if len(row) > 5 else None
+                if expires and expires > now:
+                    active_ids.add(row[0])
+
+        seen = set()
+        for row in subs_rows[1:]:
+            if not row or len(row) < 4:
+                continue
+            tid = row[0]
+            if tid not in active_ids and tid not in seen:
+                seen.add(tid)
+                filtered.append(tid)
+
+    elif filter_type == "referrers":
+        # حداقل یه بار پورسانت گرفتن
+        seen = set()
+        for row in referrals_rows[1:]:
+            if row and len(row) > 0 and row[0] and row[0] not in seen:
+                seen.add(row[0])
+                filtered.append(row[0])
+
+    elif filter_type == "gift_buyers":
+        # هدیه خریده و تایید شده
+        seen = set()
+        for row in purchases_rows[1:]:
+            if not row or len(row) < 9:
+                continue
+            if row[3].startswith("gift_") and row[8] == "approved" and row[1] not in seen:
+                seen.add(row[1])
+                filtered.append(row[1])
+
+    elif filter_type == "boosted":
+        # بوست فعال (فیلد 10)
+        for row in users_rows[1:]:
+            if not row or len(row) < 11:
+                continue
+            if row[10] and row[10].startswith("boost:"):
+                filtered.append(row[0])
+
+    return filtered
+
+
+# ─── Callback های فیلتر msklist ───
+# نکته: lambda فیلتر میکنه confirm رو جدا نگیره
+@dp.callback_query_handler(lambda c: c.data.startswith("msklist_") and c.data not in ("msklist_confirm_yes", "msklist_confirm_no"))
+async def callback_msklist_filter(callback: types.CallbackQuery):
+    """فیلتر انتخاب شده رو پردازش کن"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️ شما ادمین نیستید!", show_alert=True)
+        return
+
+    filter_type = callback.data.replace("msklist_", "")
+
+    # لیست دستی - state جدا
+    if filter_type == "manual":
+        user_states[callback.from_user.id] = {
+            "state": "awaiting_manual_id_list"
+        }
+        await callback.message.edit_text(
+            "📝 <b>لیست دستی ID ها</b>\n\n"
+            "ID های کاربران رو وارد کنید، هر کدوم یه خط جدا:\n\n"
+            "<code>123456789\n"
+            "987654321\n"
+            "111222333</code>",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
+    # فیلتر خودکار
+    filtered_ids = await get_filtered_users(filter_type)
+
+    filter_names = {
+        "active": "فعال (اشتراک دارن)",
+        "expired": "منقضی",
+        "referrers": "معرف کرده",
+        "gift_buyers": "هدیه خریده",
+        "boosted": "بوست فعال"
+    }
+
+    if not filtered_ids:
+        await callback.message.edit_text(
+            f"⚠️ هیچ کاربری در گروه <b>{filter_names.get(filter_type, filter_type)}</b> پیدا نشد.",
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+
+    # state ذخیره
+    user_states[callback.from_user.id] = {
+        "state": "awaiting_msklist_text",
+        "filter_type": filter_type,
+        "filtered_ids": filtered_ids
+    }
+
+    await callback.message.edit_text(
+        f"📋 <b>گروه: {filter_names.get(filter_type, filter_type)}</b>\n\n"
+        f"👥 تعداد کاربران: <b>{len(filtered_ids)}</b> نفر\n\n"
+        f"📝 حالا پیام خود را بنویسید:",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# ─── دریافت لیست دستی ID ها ───
+@dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_manual_id_list")
+async def handle_manual_id_list(message: types.Message):
+    """پارس لیست دستی ID ها"""
+    if not is_admin(message.from_user.id):
+        return
+
+    lines = [line.strip() for line in message.text.strip().split("\n") if line.strip()]
+    valid_ids = []
+    invalid = []
+
+    for line in lines:
+        # فقط عدد خالص رو بگیر
+        cleaned = line.split()[0] if line.split() else ""
+        try:
+            tid = int(cleaned)
+            valid_ids.append(str(tid))
+        except ValueError:
+            invalid.append(line)
+
+    if not valid_ids:
+        await message.reply("❌ هیچ ID معتبری پیدا نشد.\n\nدوباره لیست رو بفرست.")
+        return
+
+    user_states[message.from_user.id] = {
+        "state": "awaiting_msklist_text",
+        "filter_type": "manual",
+        "filtered_ids": valid_ids
+    }
+
+    invalid_msg = f"\n⚠️ نامعتبر و حذف شد: {', '.join(invalid)}" if invalid else ""
+
+    await message.reply(
+        f"✅ <b>{len(valid_ids)}</b> ID معتبر ثبت شد{invalid_msg}\n\n"
+        f"📝 حالا پیام خود را بنویسید:",
+        parse_mode="HTML"
+    )
+
+
+# ─── دریافت پیام و نشون دادن preview ───
+@dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_msklist_text")
+async def handle_msklist_text(message: types.Message):
+    """دریافت پیام و نشون دادن preview با تایید"""
+    if not is_admin(message.from_user.id):
+        return
+
+    state = user_states.get(message.from_user.id, {})
+    filtered_ids = state.get("filtered_ids", [])
+    filter_type = state.get("filter_type", "")
+    text = message.text.strip()
+
+    if not text:
+        await message.reply("❌ پیام خالیه! دوباره بنویسید.")
+        return
+
+    # state رو به مرحله تایید بذاریم
+    user_states[message.from_user.id] = {
+        "state": "confirm_msklist",
+        "filtered_ids": filtered_ids,
+        "filter_type": filter_type,
+        "text": text
+    }
+
+    filter_names = {
+        "active": "فعال",
+        "expired": "منقضی",
+        "referrers": "معرف کرده",
+        "gift_buyers": "هدیه خریده",
+        "boosted": "بوست فعال",
+        "manual": "لیست دستی"
+    }
+
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("✅ بله، بفرست", callback_data="msklist_confirm_yes"),
+        InlineKeyboardButton("❌ لغو", callback_data="msklist_confirm_no")
+    )
+
+    await message.reply(
+        f"⚠️ <b>تایید ارسال</b>\n\n"
+        f"📋 گروه: <b>{filter_names.get(filter_type, filter_type)}</b>\n"
+        f"👥 تعداد: <b>{len(filtered_ids)}</b> نفر\n\n"
+        f"📝 پیام:\n{text}\n\n"
+        f"مطمئنید؟",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+# ─── تایید و ارسال به گروه فیلتر شده ───
+@dp.callback_query_handler(lambda c: c.data == "msklist_confirm_yes")
+async def callback_msklist_send(callback: types.CallbackQuery):
+    """ارسال پیام به گروه فیلتر شده"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️ شما ادمین نیستید!", show_alert=True)
+        return
+
+    state = user_states.pop(callback.from_user.id, {})
+    filtered_ids = state.get("filtered_ids", [])
+    text = state.get("text", "")
+
+    if not text or not filtered_ids:
+        await callback.answer("❌ خطا! دوباره شروع کنید.", show_alert=True)
+        return
+
+    await callback.message.edit_text("⏳ <b>در حال ارسال...</b>", parse_mode="HTML")
+
+    success = 0
+    failed = 0
+    failed_ids = []
+
+    for tid in filtered_ids:
+        try:
+            await bot.send_message(int(tid), text, parse_mode="HTML")
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            failed += 1
+            failed_ids.append(tid)
+            logger.error(f"msklist send failed to {tid}: {e}")
+
+    report = (
+        f"✅ <b>ارسال تمام شد</b>\n\n"
+        f"📤 ارسال شد: <b>{success}</b> نفر\n"
+        f"❌ خطا: <b>{failed}</b> نفر\n"
+    )
+    if failed_ids and len(failed_ids) <= 15:
+        report += f"\n🆔 خطا دار: {', '.join(failed_ids)}"
+
+    await callback.message.edit_text(report, parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "msklist_confirm_no")
+async def callback_msklist_cancel(callback: types.CallbackQuery):
+    """لغو ارسال گروه"""
+    user_states.pop(callback.from_user.id, None)
+    await callback.message.edit_text("❌ <b>لغو شد.</b>", parse_mode="HTML")
+    await callback.answer()
 
 @dp.message_handler(commands=["createcode"])
 async def cmd_create_discount_code(message: types.Message):
@@ -4075,6 +4529,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
