@@ -1,3 +1,4 @@
+
 """
 Telegram Subscription Bot - Part 1/3
 Configuration, Google Sheets, and Core Functions
@@ -44,6 +45,7 @@ logger = logging.getLogger("TelegramBot")
 # ============================================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID")
+ADMIN2_TELEGRAM_ID = os.getenv("ADMIN2_TELEGRAM_ID")
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 GOOGLE_CREDENTIALS_ENV = os.getenv("GOOGLE_CREDENTIALS")
 
@@ -333,9 +335,13 @@ def is_valid_email(email: str) -> bool:
     return bool(re.match(pattern, email))
 
 def is_admin(user_id: int) -> bool:
-    """Check if user is admin"""
+    """Check if user is admin (اصلی یا دوم)"""
     try:
-        return str(user_id) == str(ADMIN_TELEGRAM_ID)
+        if str(user_id) == str(ADMIN_TELEGRAM_ID):
+            return True
+        if ADMIN2_TELEGRAM_ID and str(user_id) == str(ADMIN2_TELEGRAM_ID):
+            return True
+        return False
     except:
         return False
 
@@ -544,6 +550,27 @@ def main_menu_keyboard():
     kb.row(
         KeyboardButton("💬 پشتیبانی"),
         KeyboardButton("📚 راهنما")
+    )
+    return kb
+
+def admin_menu_keyboard():
+    """منوی اختصاصی ادمین با دکمه‌های مدیریتی"""
+    kb = ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(
+        KeyboardButton("📊 آمار سیستم"),
+        KeyboardButton("📢 ارسال پیام")
+    )
+    kb.row(
+        KeyboardButton("💳 تایید خریدها"),
+        KeyboardButton("💸 تایید برداشت‌ها")
+    )
+    kb.row(
+        KeyboardButton("🎟 کدهای تخفیف"),
+        KeyboardButton("🌟 کدهای بوست")
+    )
+    kb.row(
+        KeyboardButton("👤 جستجوی کاربر"),
+        KeyboardButton("🔙 منوی عادی")
     )
     return kb
 
@@ -1709,6 +1736,13 @@ async def cmd_start(message: types.Message):
         )
         return
 
+    # ✅ تشخیص ادمین و انتخاب منوی مناسب
+    if is_admin(user.id):
+        menu_kb = admin_menu_keyboard()
+        greeting = f"👋 <b>سلام {user.full_name}!</b>\n\n🔐 <b>پنل ادمین</b>"
+    else:
+        menu_kb = main_menu_keyboard()
+        greeting = f"👋 <b>سلام {user.full_name}!</b>"
     
     # ✅ نمایش منوی اصلی
     subscription = await get_active_subscription(user.id)
@@ -1721,21 +1755,20 @@ async def cmd_start(message: types.Message):
         
         await send_and_record(
             user.id,
-            f"👋 <b>سلام {user.full_name}!</b>\n\n"
+            f"{greeting}\n\n"
             f"✅ اشتراک: {sub_name}\n"
             f"📅 انقضا: <code>{expires_str}</code>\n\n"
             f"از منوی زیر استفاده کنید:",
             parse_mode="HTML",
-            reply_markup=main_menu_keyboard()
+            reply_markup=menu_kb
         )
     else:
         await send_and_record(
             user.id,
-            f"👋 <b>سلام {user.full_name}!</b>\n\n"
-            f"شما اشتراک فعالی ندارید.\n\n"
-            f"🆓 تست رایگان یا 💎 خرید اشتراک",
+            f"{greeting}\n\n"
+            f"{'از منوی مدیریت استفاده کنید:' if is_admin(user.id) else 'شما اشتراک فعالی ندارید.\n\n🆓 تست رایگان یا 💎 خرید اشتراک'}",
             parse_mode="HTML",
-            reply_markup=main_menu_keyboard()
+            reply_markup=menu_kb
         )
 
 
@@ -3267,6 +3300,390 @@ async def handle_txid_for_withdrawal(message: types.Message):
     )
 
 
+@dp.message_handler(lambda msg: msg.text == "🔙 منوی عادی")
+async def handle_back_to_user_menu(message: types.Message):
+    """برگشت از منوی ادمین به منوی کاربر عادی"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    await message.reply(
+        "🔄 بازگشت به منوی کاربر",
+        reply_markup=main_menu_keyboard()
+    )
+
+
+@dp.message_handler(lambda msg: msg.text == "📊 آمار سیستم")
+async def handle_admin_stats_menu(message: types.Message):
+    """نمایش آمار سیستم"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    # استفاده از دستور /dashboard موجود
+    await cmd_admin_dashboard(message)
+
+
+@dp.message_handler(lambda msg: msg.text == "📢 ارسال پیام")
+async def handle_admin_message_menu(message: types.Message):
+    """منوی ارسال پیام"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("📤 پیام به همه", callback_data="admin_msg_all"),
+        InlineKeyboardButton("📋 پیام به گروه", callback_data="admin_msg_group"),
+        InlineKeyboardButton("👤 پیام به فرد خاص", callback_data="admin_msg_single"),
+    )
+    
+    await message.reply(
+        "📢 <b>ارسال پیام</b>\n\n"
+        "نوع ارسال را انتخاب کنید:",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_msg_all")
+async def callback_admin_msg_all(callback: types.CallbackQuery):
+    """راهنمای broadcast"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "📤 <b>پیام به همه کاربران</b>\n\n"
+        "از دستور زیر استفاده کنید:\n\n"
+        "<code>/broadcast پیام شما</code>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_msg_group")
+async def callback_admin_msg_group(callback: types.CallbackQuery):
+    """راهنمای msklist"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    # استفاده مستقیم از منوی msklist
+    await callback.message.edit_text(
+        "📋 <b>پیام به گروه</b>\n\n"
+        "از دستور زیر استفاده کنید:\n\n"
+        "<code>/msklist</code>\n\n"
+        "یا منوی زیر را انتخاب کنید:",
+        parse_mode="HTML"
+    )
+    
+    # فراخوانی مستقیم منوی msklist
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("✅ فعال", callback_data="msklist_active"),
+        InlineKeyboardButton("⏰ منقضی", callback_data="msklist_expired"),
+        InlineKeyboardButton("🎁 معرف کرده", callback_data="msklist_referrers"),
+        InlineKeyboardButton("🎟 هدیه خریده", callback_data="msklist_gift_buyers"),
+        InlineKeyboardButton("🌟 بوست فعال", callback_data="msklist_boosted"),
+        InlineKeyboardButton("📝 لیست دستی", callback_data="msklist_manual"),
+    )
+    
+    await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_msg_single")
+async def callback_admin_msg_single(callback: types.CallbackQuery):
+    """راهنمای msg"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "👤 <b>پیام به فرد خاص</b>\n\n"
+        "از دستور زیر استفاده کنید:\n\n"
+        "<code>/msg USER_ID پیام شما</code>\n\n"
+        "مثال:\n"
+        "<code>/msg 123456789 سلام</code>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.message_handler(lambda msg: msg.text == "💳 تایید خریدها")
+async def handle_admin_purchases_menu(message: types.Message):
+    """لیست خریدهای در انتظار تایید"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    rows = await get_all_rows("Purchases")
+    pending = [row for row in rows[1:] if row and len(row) > 8 and row[8] == "pending"]
+    
+    if not pending:
+        await message.reply("✅ خریدی در انتظار تایید نیست.")
+        return
+    
+    text = "💳 <b>خریدهای در انتظار تایید:</b>\n\n"
+    for row in pending[:10]:  # فقط ۱۰ تا اول
+        purchase_id = row[0] if len(row) > 0 else ""
+        user_id = row[1] if len(row) > 1 else ""
+        product = row[3] if len(row) > 3 else ""
+        amount = row[4] if len(row) > 4 else "0"
+        
+        text += (
+            f"🔢 <code>{purchase_id}</code>\n"
+            f"👤 <code>{user_id}</code>\n"
+            f"📦 {product} - ${amount}\n\n"
+        )
+    
+    text += "\nبرای تایید/رد در Google Sheets اقدام کنید."
+    
+    await message.reply(text, parse_mode="HTML")
+
+
+@dp.message_handler(lambda msg: msg.text == "💸 تایید برداشت‌ها")
+async def handle_admin_withdrawals_menu(message: types.Message):
+    """لیست برداشت‌های در انتظار"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    rows = await get_all_rows("Withdrawals")
+    pending = [row for row in rows[1:] if row and len(row) > 6 and row[6] == "pending"]
+    
+    if not pending:
+        await message.reply("✅ برداشتی در انتظار نیست.")
+        return
+    
+    text = "💸 <b>برداشت‌های در انتظار:</b>\n\n"
+    for row in pending[:10]:
+        wd_id = row[0] if len(row) > 0 else ""
+        user_id = row[1] if len(row) > 1 else ""
+        amount = row[2] if len(row) > 2 else "0"
+        method = row[3] if len(row) > 3 else ""
+        
+        text += (
+            f"🔢 <code>{wd_id}</code>\n"
+            f"👤 <code>{user_id}</code>\n"
+            f"💰 ${amount} - {method}\n\n"
+        )
+    
+    text += "\nبرای پرداخت/رد در Google Sheets اقدام کنید."
+    
+    await message.reply(text, parse_mode="HTML")
+
+
+@dp.message_handler(lambda msg: msg.text == "🎟 کدهای تخفیف")
+async def handle_admin_discount_codes_menu(message: types.Message):
+    """راهنمای کدهای تخفیف"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ ساخت کد", callback_data="admin_create_discount"),
+        InlineKeyboardButton("📋 لیست کدها", callback_data="admin_list_discount")
+    )
+    
+    await message.reply(
+        "🎟 <b>مدیریت کدهای تخفیف</b>",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_create_discount")
+async def callback_create_discount(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "➕ <b>ساخت کد تخفیف</b>\n\n"
+        "از دستور زیر استفاده کنید:\n\n"
+        "<code>/createcode CODE PERCENT MAX_USES VALID_DAYS</code>\n\n"
+        "مثال:\n"
+        "<code>/createcode SUMMER20 20 100 30</code>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_list_discount")
+async def callback_list_discount(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    # استفاده از /listcodes موجود
+    rows = await get_all_rows("DiscountCodes")
+    
+    if len(rows) <= 1:
+        await callback.message.edit_text("📋 هیچ کد تخفیفی وجود ندارد.")
+        await callback.answer()
+        return
+    
+    text = "📋 <b>کدهای تخفیف:</b>\n\n"
+    
+    for row in rows[1:][:10]:  # ۱۰ تا اول
+        if not row or len(row) < 8:
+            continue
+        
+        code = row[0]
+        discount = row[1]
+        max_uses = int(row[2]) if row[2] else 0
+        used = row[3]
+        status = row[7]
+        
+        status_emoji = "✅" if status == "active" else "❌"
+        
+        text += (
+            f"{status_emoji} <code>{code}</code> - {discount}%\n"
+            f"   استفاده: {used}/{max_uses if max_uses > 0 else '∞'}\n\n"
+        )
+    
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.message_handler(lambda msg: msg.text == "🌟 کدهای بوست")
+async def handle_admin_boost_codes_menu(message: types.Message):
+    """راهنمای کدهای بوست"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ ساخت کد", callback_data="admin_create_boost"),
+        InlineKeyboardButton("📋 لیست کدها", callback_data="admin_list_boost")
+    )
+    
+    await message.reply(
+        "🌟 <b>مدیریت کدهای بوست</b>",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_create_boost")
+async def callback_create_boost(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "➕ <b>ساخت کد بوست</b>\n\n"
+        "از دستور زیر استفاده کنید:\n\n"
+        "<code>/createboost CODE L1% L2% MAX_USES VALID_DAYS</code>\n\n"
+        "مثال:\n"
+        "<code>/createboost VIP15 15 20 5 90</code>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_list_boost")
+async def callback_list_boost(callback: types.CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    rows = await get_all_rows("BoostCodes")
+    
+    if len(rows) <= 1:
+        await callback.message.edit_text("📋 هیچ کد بوستی وجود ندارد.")
+        await callback.answer()
+        return
+    
+    text = "📋 <b>کدهای بوست:</b>\n\n"
+    
+    for row in rows[1:][:10]:
+        if not row or len(row) < 9:
+            continue
+        
+        code = row[0]
+        l1 = row[1]
+        l2 = row[2]
+        max_uses = int(row[3]) if row[3] else 0
+        used = row[4] if len(row) > 4 else "0"
+        status = row[8] if len(row) > 8 else ""
+        
+        status_emoji = "✅" if status == "active" else "❌"
+        
+        text += (
+            f"{status_emoji} <code>{code}</code>\n"
+            f"   📊 L1: {l1}% | L2: {l2}%\n"
+            f"   👥 استفاده: {used}/{max_uses if max_uses > 0 else '∞'}\n\n"
+        )
+    
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.message_handler(lambda msg: msg.text == "👤 جستجوی کاربر")
+async def handle_admin_user_search_menu(message: types.Message):
+    """راهنمای جستجوی کاربر"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    user_states[message.from_user.id] = {"state": "awaiting_user_search"}
+    
+    await message.reply(
+        "👤 <b>جستجوی کاربر</b>\n\n"
+        "ID تلگرام کاربر را وارد کنید:",
+        parse_mode="HTML"
+    )
+
+
+@dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_user_search")
+async def handle_user_search_query(message: types.Message):
+    """پردازش جستجوی کاربر"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    user_states.pop(message.from_user.id, None)
+    
+    try:
+        search_id = int(message.text.strip())
+    except ValueError:
+        await message.reply("❌ ID نامعتبر!")
+        return
+    
+    result = await find_user(search_id)
+    
+    if not result:
+        await message.reply(f"❌ کاربری با ID <code>{search_id}</code> یافت نشد.", parse_mode="HTML")
+        return
+    
+    _, user_row = result
+    
+    username = user_row[1] if len(user_row) > 1 else ""
+    full_name = user_row[2] if len(user_row) > 2 else ""
+    email = user_row[3] if len(user_row) > 3 else ""
+    referral_code = user_row[4] if len(user_row) > 4 else ""
+    balance = user_row[6] if len(user_row) > 6 else "0"
+    status = user_row[7] if len(user_row) > 7 else ""
+    
+    # چک اشتراک
+    subscription = await get_active_subscription(search_id)
+    sub_info = "❌ ندارد"
+    if subscription:
+        sub_type = subscription[2] if len(subscription) > 2 else ""
+        expires = parse_iso(subscription[5]) if len(subscription) > 5 else None
+        expires_str = expires.strftime("%Y/%m/%d") if expires else "نامشخص"
+        sub_info = f"✅ {sub_type} تا {expires_str}"
+    
+    text = (
+        f"👤 <b>اطلاعات کاربر</b>\n\n"
+        f"🆔 ID: <code>{search_id}</code>\n"
+        f"👤 نام: {full_name}\n"
+        f"📱 یوزرنیم: @{username or 'ندارد'}\n"
+        f"📧 ایمیل: {email or 'ندارد'}\n"
+        f"🎁 کد معرف: <code>{referral_code}</code>\n"
+        f"💰 موجودی: ${balance}\n"
+        f"📊 وضعیت: {status}\n"
+        f"📅 اشتراک: {sub_info}"
+    )
+    
+    await message.reply(text, parse_mode="HTML")
+
 # ============================================
 # ADMIN COMMANDS
 # ============================================
@@ -4529,6 +4946,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
