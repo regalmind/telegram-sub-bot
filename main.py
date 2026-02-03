@@ -152,6 +152,10 @@ SHEET_DEFINITIONS = {
     "gift_code", "product", "amount_usd", "buyer_id", 
     "buyer_username", "recipient_id", "recipient_username",
     "message", "status", "created_at", "redeemed_at"
+    ],
+    "BoostCodes": [
+    "code", "level1_percent", "level2_percent", "max_uses",
+    "used_count", "valid_until", "created_by", "created_at", "status"
     ]
 }
 
@@ -682,7 +686,16 @@ async def process_referral_commission(purchase_id: str, buyer_id: int, amount_us
         return
     
     # Level 1: 8%
-    level1_commission = amount_usd * 0.08
+    # چک بوست ویژه برای معرف
+    referrer_boost = await get_user_boost(int(referrer_id))
+
+    if referrer_boost:
+        level1_rate = referrer_boost["level1"] / 100  # مثلاً 15% = 0.15
+    else:
+        level1_rate = 0.08  # پیش‌فرض ۸٪
+
+    level1_commission = amount_usd * level1_rate
+
     await update_user_balance(int(referrer_id), level1_commission, add=True)
     
     await append_row("Referrals", [
@@ -709,14 +722,22 @@ async def process_referral_commission(purchase_id: str, buyer_id: int, amount_us
     except:
         pass
     
-    # Level 2: 12%
+      # Level 2: 12% (یا بوست ویژه اگه داشته باشه)
     referrer_result = await find_user(int(referrer_id))
     if referrer_result:
         _, referrer_row = referrer_result
         level2_referrer_id = referrer_row[5] if len(referrer_row) > 5 else ""
         
         if level2_referrer_id and level2_referrer_id != str(buyer_id):
-            level2_commission = amount_usd * 0.12
+            # چک بوست ویژه برای معرف سطح 2
+            level2_referrer_boost = await get_user_boost(int(level2_referrer_id))
+            
+            if level2_referrer_boost:
+                level2_rate = level2_referrer_boost["level2"] / 100
+            else:
+                level2_rate = 0.12  # پیش‌فرض ۱۲٪
+            
+            level2_commission = amount_usd * level2_rate
             await update_user_balance(int(level2_referrer_id), level2_commission, add=True)
             
             await append_row("Referrals", [
@@ -731,16 +752,19 @@ async def process_referral_commission(purchase_id: str, buyer_id: int, amount_us
             ])
             
             try:
+                boost_badge = "🌟 " if level2_referrer_boost else ""
                 await bot.send_message(
                     int(level2_referrer_id),
-                    f"🎉 <b>پورسانت سطح 2!</b>\n\n"
+                    f"🎉 <b>پورسانت سطح 2!</b>{boost_badge}\n\n"
                     f"💰 مبلغ: <b>${level2_commission:.2f}</b>\n"
+                    f"📊 نرخ: <b>{int(level2_rate * 100)}%</b>\n"
                     f"👤 از: <code>{buyer_id}</code>\n\n"
                     f"💎 موجودی شما افزایش یافت!",
                     parse_mode="HTML"
                 )
             except:
                 pass
+
 
 # ============================================
 # SUBSCRIPTION MANAGEMENT
@@ -1233,6 +1257,136 @@ async def redeem_gift_card(gift_code: str, recipient_id: int, recipient_username
     except Exception as e:
         logger.exception(f"Error redeeming gift card: {e}")
         return None
+
+async def create_boost_code(code: str, level1_percent: int, level2_percent: int, max_uses: int, valid_days: int, created_by: int) -> bool:
+    """Create a new boost code (secret commission boost)"""
+    try:
+        # چک کد تکراری
+        rows = await get_all_rows("BoostCodes")
+        for row in rows[1:]:
+            if row and row[0].upper() == code.upper():
+                return False
+        
+        valid_until = (datetime.utcnow() + timedelta(days=valid_days)).replace(microsecond=0).isoformat()
+        
+        await append_row("BoostCodes", [
+            code.upper(),
+            str(level1_percent),
+            str(level2_percent),
+            str(max_uses),
+            "0",
+            valid_until,
+            str(created_by),
+            now_iso(),
+            "active"
+        ])
+        
+        logger.info(f"✅ Boost code created: {code} | L1: {level1_percent}% | L2: {level2_percent}%")
+        return True
+        
+    except Exception as e:
+        logger.exception(f"Error creating boost code: {e}")
+        return False
+
+
+async def validate_and_apply_boost(code: str, telegram_id: int) -> Optional[Dict[str, Any]]:
+    """Validate boost code and apply to user"""
+    try:
+        rows = await get_all_rows("BoostCodes")
+        now = datetime.utcnow()
+        
+        for idx, row in enumerate(rows[1:], start=2):
+            if not row or len(row) < 9:
+                continue
+            
+            if row[0].upper() != code.upper():
+                continue
+            
+            # چک وضعیت
+            status = row[8] if len(row) > 8 else ""
+            if status != "active":
+                return None
+            
+            # چک تاریخ انقضا
+            valid_until = parse_iso(row[5]) if len(row) > 5 else None
+            if valid_until and valid_until < now:
+                return None
+            
+            # چک تعداد استفاده
+            max_uses = int(row[3]) if len(row) > 3 and row[3] else 0
+            used_count = int(row[4]) if len(row) > 4 and row[4] else 0
+            if max_uses > 0 and used_count >= max_uses:
+                return None
+            
+            # دریافت درصدها
+            level1_percent = int(row[1]) if len(row) > 1 and row[1] else 8
+            level2_percent = int(row[2]) if len(row) > 2 and row[2] else 12
+            
+            # چک اگه این کاربر قبلاً این کد رو فعال کرده
+            users_rows = await get_all_rows("Users")
+            for u_idx, u_row in enumerate(users_rows[1:], start=2):
+                if u_row and str(u_row[0]) == str(telegram_id):
+                    # نگه داشتن بوست در فیلد notes (فیلد ۱۰ به بعد)
+                    # چک اگه قبلاً بوستی داره
+                    if len(u_row) > 10 and u_row[10] and u_row[10].startswith("boost:"):
+                        return {"error": "already_boosted"}
+                    break
+            
+            # افزایش شمارنده استفاده
+            row[4] = str(used_count + 1)
+            await update_row("BoostCodes", idx, row)
+            
+            # ذخیره بوست در فیلد اضافی کاربر
+            for u_idx, u_row in enumerate(users_rows[1:], start=2):
+                if u_row and str(u_row[0]) == str(telegram_id):
+                    # اضافه فیلد بوست
+                    while len(u_row) < 11:
+                        u_row.append("")
+                    u_row[10] = f"boost:{code}:{level1_percent}:{level2_percent}"
+                    await update_row("Users", u_idx, u_row)
+                    break
+            
+            logger.info(f"✅ Boost applied: {code} to user {telegram_id} | L1: {level1_percent}% | L2: {level2_percent}%")
+            
+            return {
+                "code": code,
+                "level1_percent": level1_percent,
+                "level2_percent": level2_percent
+            }
+        
+        return None
+        
+    except Exception as e:
+        logger.exception(f"Error applying boost: {e}")
+        return None
+
+
+async def get_user_boost(telegram_id: int) -> Optional[Dict[str, int]]:
+    """Get user's active boost rates"""
+    try:
+        result = await find_user(telegram_id)
+        if not result:
+            return None
+        
+        _, row = result
+        
+        # چک فیلد بوست (فیلد ۱۰)
+        if len(row) > 10 and row[10] and row[10].startswith("boost:"):
+            parts = row[10].split(":")
+            # فرمت: boost:CODE:L1_PERCENT:L2_PERCENT
+            if len(parts) >= 4:
+                return {
+                    "code": parts[1],
+                    "level1": int(parts[2]),
+                    "level2": int(parts[3])
+                }
+        
+        return None
+        
+    except Exception as e:
+        logger.exception(f"Error getting user boost: {e}")
+        return None
+
 
 async def calculate_dashboard_stats() -> Dict[str, Any]:
     """Calculate comprehensive dashboard statistics"""
@@ -3017,6 +3171,56 @@ async def cmd_report(message: types.Message):
             reply_markup=main_menu_keyboard()
         )
 
+@dp.message_handler(commands=["redeem"])
+async def cmd_redeem_secret(message: types.Message):
+    """Secret command: redeem boost code - نه توی راهنما، نه توی منو"""
+    user = message.from_user
+    args = message.get_args()
+    
+    if not args:
+        # اگه بدون آرگیمنت بزنه، هیچ پاسخی نده تا مخفی بمونه
+        return
+    
+    code = args.strip().upper()
+    
+    result = await validate_and_apply_boost(code, user.id)
+    
+    if result is None:
+        # کد نامعتبر - هیچ پاسخی نده تا مخفی بمونه
+        return
+    
+    if result.get("error") == "already_boosted":
+        await message.reply(
+            "✅ <b>شما قبلاً یک آفر ویژه فعال دارید!</b>",
+            parse_mode="HTML"
+        )
+        return
+    
+    # موفق شد
+    await message.reply(
+        f"🌟 <b>آفر ویژه فعال شد!</b>\n\n"
+        f"💎 سطح 1: <b>{result['level1_percent']}%</b>\n"
+        f"💎 سطح 2: <b>{result['level2_percent']}%</b>\n\n"
+        f"🎯 از این لحظه پورسانت شما با نرخ جدید محاسبه میشه!",
+        parse_mode="HTML"
+    )
+    
+    # نوتیفیکیشن به ادمین
+    if ADMIN_TELEGRAM_ID:
+        try:
+            await bot.send_message(
+                int(ADMIN_TELEGRAM_ID),
+                f"🔔 <b>بوست فعال شد</b>\n\n"
+                f"👤 کاربر: {user.full_name} (@{user.username or 'ندارد'})\n"
+                f"🆔 ID: <code>{user.id}</code>\n"
+                f"🎟 کد: <code>{result['code']}</code>\n"
+                f"📊 سطح 1: {result['level1_percent']}% | سطح 2: {result['level2_percent']}%",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+
+
 @dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_txid_for_withdrawal")
 async def handle_txid_for_withdrawal(message: types.Message):
     """Handle TXID from admin for withdrawal approval"""
@@ -3301,6 +3505,104 @@ async def cmd_admin_dashboard(message: types.Message):
     
     await message.reply(dashboard_text, parse_mode="HTML")
 
+@dp.message_handler(commands=["createboost"])
+async def cmd_create_boost(message: types.Message):
+    """Admin: Create secret boost code"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    parts = message.text.split()
+    
+    if len(parts) < 4:
+        await message.reply(
+            "📝 <b>ساخت کد بوست پورسانت</b>\n\n"
+            "فرمت:\n"
+            "<code>/createboost CODE L1% L2% MAX_USES VALID_DAYS</code>\n\n"
+            "مثال:\n"
+            "<code>/createboost VIP15 15 20 5 90</code>\n\n"
+            "توضیحات:\n"
+            "• CODE: کد مخفی\n"
+            "• L1%: درصد پورسانت سطح 1\n"
+            "• L2%: درصد پورسانت سطح 2\n"
+            "• MAX_USES: حداکثر استفاده (0 = نامحدود)\n"
+            "• VALID_DAYS: اعتبار به روز (پیش‌فرض 365)",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        code = parts[1].upper()
+        level1 = int(parts[2])
+        level2 = int(parts[3])
+        max_uses = int(parts[4]) if len(parts) > 4 else 0
+        valid_days = int(parts[5]) if len(parts) > 5 else 365
+        
+        # validation
+        if not (1 <= level1 <= 50):
+            await message.reply("❌ سطح 1 باید بین ۱ تا ۵۰ باشد!")
+            return
+        if not (1 <= level2 <= 50):
+            await message.reply("❌ سطح 2 باید بین ۱ تا ۵۰ باشد!")
+            return
+        
+        success = await create_boost_code(code, level1, level2, max_uses, valid_days, message.from_user.id)
+        
+        if success:
+            await message.reply(
+                f"✅ <b>کد بوست ساخته شد!</b>\n\n"
+                f"🎟 کد: <code>{code}</code>\n"
+                f"📊 سطح 1: <b>{level1}%</b>\n"
+                f"📊 سطح 2: <b>{level2}%</b>\n"
+                f"👥 حداکثر استفاده: {max_uses if max_uses > 0 else 'نامحدود'}\n"
+                f"📅 اعتبار: {valid_days} روز\n\n"
+                f"💡 دستور فعال کردن برای کاربر:\n"
+                f"<code>/redeem {code}</code>",
+                parse_mode="HTML"
+            )
+        else:
+            await message.reply("❌ کد تکراری است!")
+    
+    except ValueError:
+        await message.reply("❌ مقادیر نامعتبر! فقط عدد وارد کنید.")
+
+
+@dp.message_handler(commands=["listboosts"])
+async def cmd_list_boosts(message: types.Message):
+    """Admin: List all boost codes"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    rows = await get_all_rows("BoostCodes")
+    
+    if len(rows) <= 1:
+        await message.reply("📋 هیچ کد بوستی وجود ندارد.")
+        return
+    
+    text = "📋 <b>کدهای بوست پورسانت:</b>\n\n"
+    
+    for row in rows[1:]:
+        if not row or len(row) < 9:
+            continue
+        
+        code = row[0]
+        l1 = row[1]
+        l2 = row[2]
+        max_uses = int(row[3]) if row[3] else 0
+        used = row[4] if len(row) > 4 else "0"
+        valid_until = parse_iso(row[5]) if len(row) > 5 else None
+        status = row[8] if len(row) > 8 else ""
+        
+        valid_str = valid_until.strftime("%Y/%m/%d") if valid_until else "نامشخص"
+        status_emoji = "✅" if status == "active" else "❌"
+        
+        text += (
+            f"{status_emoji} <code>{code}</code>\n"
+            f"   📊 L1: {l1}% | L2: {l2}%\n"
+            f"   👥 استفاده: {used}/{max_uses if max_uses > 0 else '∞'}\n"
+            f"   📅 تا: {valid_str}\n\n"
+        )
+    
+    await message.reply(text, parse_mode="HTML")
 
 
 # ============================================
@@ -3763,6 +4065,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
