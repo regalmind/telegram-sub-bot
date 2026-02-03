@@ -113,7 +113,7 @@ SHEET_DEFINITIONS = {
     "Users": [
         "telegram_id", "username", "full_name", "email", 
         "referral_code", "referred_by", "wallet_balance", 
-        "status", "created_at", "last_seen"
+        "status", "created_at", "last_seen", "boost_data"
     ],
     "Subscriptions": [
         "telegram_id", "username", "subscription_type", 
@@ -2126,10 +2126,12 @@ Payment Processing & Wallet System
 @dp.callback_query_handler(lambda c: c.data.startswith("pay_"))
 async def callback_payment_method(callback: types.CallbackQuery):
     """Payment method selection"""
+    user = callback.from_user                          # ✅ فیکس #1: user اول تعریف شد
+
     parts = callback.data.split("_")
-    method = parts[1]
-    product = parts[2]
-    
+    method = parts[1]                                  # card یا usdt
+    product = "_".join(parts[2:])                      # ✅ فیکس #3: gift_normal درست پارس میشه
+
     # چک اگر هدیه است
     is_gift = product.startswith("gift_")
     if is_gift:
@@ -2138,19 +2140,21 @@ async def callback_payment_method(callback: types.CallbackQuery):
     else:
         actual_product = product
         price_usd = NORMAL_PRICE if product == "normal" else PREMIUM_PRICE
-   
-    price_usd = NORMAL_PRICE if product == "normal" else PREMIUM_PRICE
-    # چک کد تخفیف
+                                                       # ✅ فیکس #2: خط overwrite حذف شد
+
+    # چک کد تخفیف - فقط اگه هدیه نباشه
     discount_applied = 0
-    if user.id in user_states and "discount_code" in user_states[user.id]:
-        code = user_states[user.id]["discount_code"]
-        validation = await validate_discount_code(code)
-    
-        if validation:
-            discount_percent, _ = validation
-            discount_applied = discount_percent
-            price_usd = price_usd * (100 - discount_percent) / 100
-            logger.info(f"✅ Discount applied: {code} ({discount_percent}%)")
+    if not is_gift:                                    # ✅ فیکس #4: discount روی gift نیست
+        if user.id in user_states and "discount_code" in user_states[user.id]:
+            code = user_states[user.id]["discount_code"]
+            validation = await validate_discount_code(code)
+
+            if validation:
+                discount_percent, _ = validation
+                discount_applied = discount_percent
+                price_usd = price_usd * (100 - discount_percent) / 100
+                logger.info(f"✅ Discount applied: {code} ({discount_percent}%)")
+
 
     user = callback.from_user
     
@@ -2445,8 +2449,9 @@ async def callback_admin_card_approval(callback: types.CallbackQuery):
 # ============================================
 # ADMIN APPROVAL
 # ============================================
-@dp.callback_query_handler(lambda c: c.data.startswith("approve_") or c.data.startswith("reject_"))
+@dp.callback_query_handler(lambda c: (c.data.startswith("approve_") or c.data.startswith("reject_")) and not c.data.startswith("approve_card_") and not c.data.startswith("reject_card_") and not c.data.startswith("approve_wd_") and not c.data.startswith("reject_wd_"))
 async def callback_admin_purchase(callback: types.CallbackQuery):
+
     """Admin purchase approval"""
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔️ شما ادمین نیستید!", show_alert=True)
@@ -3009,6 +3014,12 @@ async def handle_referral(message: types.Message):
     
     bot_username = (await bot.get_me()).username
     referral_link = f"https://t.me/{bot_username}?start={referral_code}"
+
+    # ✅ نرخ پورسانت دینامیک - اگه بوست داشته باشه از اون نرخ نشون بده
+    user_boost = await get_user_boost(user.id)
+    l1_rate = user_boost["level1"] if user_boost else 8
+    l2_rate = user_boost["level2"] if user_boost else 12
+    boost_badge = "🌟 " if user_boost else ""
     
     # ✅ آپدیت #19: اضافه دکمه اشتراک‌گذاری لینک معرف
     import urllib.parse
@@ -3039,20 +3050,19 @@ async def handle_referral(message: types.Message):
         f"🔗 <b>لینک:</b>\n<code>{referral_link}</code>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📊 <b>آمار:</b>\n"
-        f"👥 سطح 1: {level1_count} نفر (8%)\n"
-        f"👥 سطح 2: {level2_count} نفر (12%)\n"
+        f"👥 سطح 1: {level1_count} نفر ({boost_badge}{l1_rate}%)\n"
+        f"👥 سطح 2: {level2_count} نفر ({boost_badge}{l2_rate}%)\n"
         f"💰 کل درآمد: <b>${total_earned:.2f}</b>\n\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"💡 <b>کسب درآمد:</b>\n"
         f"• از لینک بالا دعوت کنید\n"
         f"• هر خرید = پورسانت\n"
-        f"• سطح 1: 8%\n"
-        f"• سطح 2: 12%\n\n"
+        f"• سطح 1: {l1_rate}%\n"
+        f"• سطح 2: {l2_rate}%\n\n"
         f"📢 لینک خود را به اشتراک بگذارید:",
         parse_mode="HTML",
         reply_markup=kb_share
     )
-
 
 
 # ============================================
@@ -4065,6 +4075,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
