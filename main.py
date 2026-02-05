@@ -4490,6 +4490,13 @@ async def cmd_list_boosts(message: types.Message):
     await message.reply(text, parse_mode="HTML")
 
 
+@dp.message_handler(commands=["reset"])
+async def cmd_reset(message: types.Message):
+    """پاک کردن state"""
+    user_states.pop(message.from_user.id, None)
+    await message.reply("✅ State پاک شد. الان /start بزن")
+
+
 # ============================================
 # CALLBACK HANDLERS
 # ============================================
@@ -4950,6 +4957,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
