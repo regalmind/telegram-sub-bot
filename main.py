@@ -159,6 +159,17 @@ SHEET_DEFINITIONS = {
     "BoostCodes": [
     "code", "level1_percent", "level2_percent", "max_uses",
     "used_count", "valid_until", "created_by", "created_at", "status"
+    ],
+    "Affiliates": [  # ← شیت جدید
+        "telegram_id",      # ID افیلیت
+        "username",         # یوزرنیم
+        "full_name",        # نام کامل
+        "max_depth",        # حداکثر سطح (مثلاً ۱۰)
+        "rate_percent",     # نرخ پورسانت برای سطح ۳+ (مثلاً ۵)
+        "status",           # active / inactive
+        "created_at",       # تاریخ ساخت
+        "created_by",       # ادمینی که ساخته
+        "notes"             # یادداشت
     ]
 }
 
@@ -446,8 +457,8 @@ async def set_usdt_price_in_config(new_price: float) -> bool:
         return False
 
 
-# 
 
+# 
 
 # ============================================
 # TELEGRAM HELPERS
@@ -676,8 +687,137 @@ async def clear_user_reserve(telegram_id: int) -> bool:
         logger.exception(f"Error clearing reserve: {e}")
         return False
 
+async def is_affiliate(telegram_id: int) -> bool:
+    """چک اگه این کاربر افیلیت هست"""
+    try:
+        rows = await get_all_rows("Affiliates")
+        
+        for row in rows[1:]:
+            if not row or len(row) < 6:
+                continue
+            
+            if str(row[0]) == str(telegram_id) and row[5] == "active":
+                return True
+        
+        return False
+    except:
+        return False
 
-# 
+
+async def get_affiliate_config(telegram_id: int) -> dict:
+    """
+    دریافت تنظیمات افیلیت
+    Returns: {"is_affiliate": bool, "max_depth": int, "rate": float}
+    """
+    try:
+        rows = await get_all_rows("Affiliates")
+        
+        for row in rows[1:]:
+            if not row or len(row) < 6:
+                continue
+            
+            if str(row[0]) == str(telegram_id) and row[5] == "active":
+                return {
+                    "is_affiliate": True,
+                    "max_depth": int(row[3]) if len(row) > 3 and row[3] else 10,
+                    "rate": float(row[4]) if len(row) > 4 and row[4] else 5.0
+                }
+        
+        return {"is_affiliate": False, "max_depth": 0, "rate": 0.0}
+        
+    except Exception as e:
+        logger.exception(f"Error getting affiliate config: {e}")
+        return {"is_affiliate": False, "max_depth": 0, "rate": 0.0}
+
+
+async def create_affiliate(telegram_id: int, max_depth: int, rate_percent: float, created_by: int, notes: str = "") -> bool:
+    """ساخت افیلیت جدید"""
+    try:
+        # چک تکراری
+        rows = await get_all_rows("Affiliates")
+        for row in rows[1:]:
+            if row and str(row[0]) == str(telegram_id):
+                return False  # قبلاً وجود داره
+        
+        # دریافت اطلاعات کاربر
+        user_result = await find_user(telegram_id)
+        username = ""
+        full_name = ""
+        
+        if user_result:
+            _, user_row = user_result
+            username = user_row[1] if len(user_row) > 1 else ""
+            full_name = user_row[2] if len(user_row) > 2 else ""
+        
+        # ساخت افیلیت
+        await append_row("Affiliates", [
+            str(telegram_id),
+            username,
+            full_name,
+            str(max_depth),
+            str(rate_percent),
+            "active",
+            now_iso(),
+            str(created_by),
+            notes
+        ])
+        
+        logger.info(f"✅ Affiliate created: {telegram_id} | depth={max_depth} | rate={rate_percent}%")
+        return True
+        
+    except Exception as e:
+        logger.exception(f"Error creating affiliate: {e}")
+        return False
+
+
+async def update_affiliate(telegram_id: int, max_depth: int = None, rate_percent: float = None) -> bool:
+    """آپدیت تنظیمات افیلیت"""
+    try:
+        rows = await get_all_rows("Affiliates")
+        
+        for idx, row in enumerate(rows[1:], start=2):
+            if not row or str(row[0]) != str(telegram_id):
+                continue
+            
+            # آپدیت فیلدها
+            if max_depth is not None:
+                row[3] = str(max_depth)
+            
+            if rate_percent is not None:
+                row[4] = str(rate_percent)
+            
+            await update_row("Affiliates", idx, row)
+            logger.info(f"✅ Affiliate updated: {telegram_id} | depth={max_depth} | rate={rate_percent}%")
+            return True
+        
+        return False  # پیدا نشد
+        
+    except Exception as e:
+        logger.exception(f"Error updating affiliate: {e}")
+        return False
+
+
+async def deactivate_affiliate(telegram_id: int) -> bool:
+    """غیرفعال کردن افیلیت"""
+    try:
+        rows = await get_all_rows("Affiliates")
+        
+        for idx, row in enumerate(rows[1:], start=2):
+            if not row or str(row[0]) != str(telegram_id):
+                continue
+            
+            row[5] = "inactive"
+            await update_row("Affiliates", idx, row)
+            logger.info(f"✅ Affiliate deactivated: {telegram_id}")
+            return True
+        
+        return False
+        
+    except Exception as e:
+        logger.exception(f"Error deactivating affiliate: {e}")
+        return False
+
+
 
 # ============================================
 # PART 1 COMPLETE - Continue to Part 2
@@ -726,9 +866,10 @@ def admin_menu_keyboard():
     )
     kb.row(
         KeyboardButton("👤 جستجوی کاربر"),
-        KeyboardButton("💱 قیمت تتر")  # ← دکمه جدید
+        KeyboardButton("💱 قیمت تتر")
     )
     kb.row(
+        KeyboardButton("💎 افیلیت‌ها"),  # ← دکمه جدید (مخفی)
         KeyboardButton("🔙 منوی عادی")
     )
     return kb
@@ -950,13 +1091,59 @@ async def check_reserve_block(message: types.Message) -> bool:
     return False  # بلاک شد
 
 
-# 
+
+async def get_referral_chain(telegram_id: int, max_levels: int = 20) -> list:
+    """
+    دریافت زنجیره معرف‌ها از کاربر به سطح بالا
+    Returns: [{"level": 1, "referrer_id": "123"}, {"level": 2, "referrer_id": "456"}, ...]
+    """
+    try:
+        chain = []
+        current_id = telegram_id
+        level = 1
+        
+        users_rows = await get_all_rows("Users")
+        
+        while level <= max_levels:
+            # پیدا کردن referrer فعلی
+            referrer_id = None
+            
+            for row in users_rows[1:]:
+                if not row or str(row[0]) != str(current_id):
+                    continue
+                
+                referrer_id = row[5] if len(row) > 5 and row[5] else None
+                break
+            
+            # اگه referrer نداره یا خودش بود، تموم شد
+            if not referrer_id or referrer_id == str(telegram_id):
+                break
+            
+            chain.append({
+                "level": level,
+                "referrer_id": referrer_id
+            })
+            
+            current_id = int(referrer_id)
+            level += 1
+        
+        return chain
+        
+    except Exception as e:
+        logger.exception(f"Error getting referral chain: {e}")
+        return []
+
+
     
 # ============================================
 # REFERRAL SYSTEM
 # ============================================
 async def process_referral_commission(purchase_id: str, buyer_id: int, amount_usd: float):
-    """Process referral commissions با محدودیت سقف خرید"""
+    """
+    Process referral commissions - با پشتیبانی افیلیت عمیق
+    سطح ۱ و ۲: مثل همیشه (۸% و ۱۲% یا بوست)
+    سطح ۳+: فقط برای افیلیت‌ها
+    """
     buyer_result = await find_user(buyer_id)
     if not buyer_result:
         return
@@ -967,23 +1154,23 @@ async def process_referral_commission(purchase_id: str, buyer_id: int, amount_us
     if not referrer_id:
         return
     
-    # ✅ دریافت سقف خرید referrer (Level 1)
+    # ✅ دریافت سقف خرید referrer سطح ۱
     referrer_max_purchase = await get_user_max_purchase(int(referrer_id))
-    
-    # محاسبه مبلغ قابل پورسانت (محدود به سقف خرید referrer)
     cappable_amount = min(amount_usd, referrer_max_purchase) if referrer_max_purchase > 0 else 0
     
     if cappable_amount <= 0:
-        logger.info(f"⚠️ Referrer {referrer_id} has no purchase, skipping commission")
+        logger.info(f"⚠️ Referrer {referrer_id} has no purchase, skipping")
         return
     
-    # Level 1: محاسبه با سقف
+    # ═══════════════════════════════════════════════════════
+    # Level 1: سطح اول (مثل قبل)
+    # ═══════════════════════════════════════════════════════
     referrer_boost = await get_user_boost(int(referrer_id))
     
     if referrer_boost:
         level1_rate = referrer_boost["level1"] / 100
     else:
-        level1_rate = 0.08  # پیش‌فرض ۸٪
+        level1_rate = 0.08
     
     level1_commission = cappable_amount * level1_rate
     
@@ -1000,7 +1187,7 @@ async def process_referral_commission(purchase_id: str, buyer_id: int, amount_us
         now_iso()
     ])
     
-    # Notify level 1
+    # Notify
     try:
         cap_note = ""
         if amount_usd > referrer_max_purchase:
@@ -1017,63 +1204,123 @@ async def process_referral_commission(purchase_id: str, buyer_id: int, amount_us
     except:
         pass
     
-    # ✅ چک بوست خودکار
+    # بوست خودکار
     asyncio.create_task(check_and_grant_auto_boost(int(referrer_id)))
     
-    # Level 2: محاسبه با سقف
+    # ═══════════════════════════════════════════════════════
+    # Level 2: سطح دوم (مثل قبل)
+    # ═══════════════════════════════════════════════════════
     referrer_result = await find_user(int(referrer_id))
     if referrer_result:
         _, referrer_row = referrer_result
         level2_referrer_id = referrer_row[5] if len(referrer_row) > 5 else ""
         
         if level2_referrer_id and level2_referrer_id != str(buyer_id):
-            # ✅ دریافت سقف خرید referrer سطح ۲
+            # سقف سطح ۲
             level2_max_purchase = await get_user_max_purchase(int(level2_referrer_id))
             level2_cappable_amount = min(amount_usd, level2_max_purchase) if level2_max_purchase > 0 else 0
             
-            if level2_cappable_amount <= 0:
-                logger.info(f"⚠️ Level2 referrer {level2_referrer_id} has no purchase, skipping")
-                return
-            
-            # چک بوست ویژه
-            level2_referrer_boost = await get_user_boost(int(level2_referrer_id))
-            
-            if level2_referrer_boost:
-                level2_rate = level2_referrer_boost["level2"] / 100
-            else:
-                level2_rate = 0.12  # پیش‌فرض ۱۲٪
-            
-            level2_commission = level2_cappable_amount * level2_rate
-            await update_user_balance(int(level2_referrer_id), level2_commission, add=True)
-            
-            await append_row("Referrals", [
-                str(level2_referrer_id),
-                str(buyer_id),
-                "2",
-                str(level2_commission),
-                "paid",
-                purchase_id,
-                now_iso(),
-                now_iso()
-            ])
-            
-            try:
-                cap_note_l2 = ""
-                if amount_usd > level2_max_purchase:
-                    cap_note_l2 = f"\n\n💡 پورسانت تا سقف خرید شما (${level2_max_purchase}) محاسبه شد."
+            if level2_cappable_amount > 0:
+                # نرخ
+                level2_boost = await get_user_boost(int(level2_referrer_id))
                 
-                boost_badge = "🌟 " if level2_referrer_boost else ""
-                await bot.send_message(
-                    int(level2_referrer_id),
-                    f"🎉 <b>پورسانت سطح 2!</b>{boost_badge}\n\n"
-                    f"💰 مبلغ: <b>${level2_commission:.2f}</b>\n"
-                    f"📊 نرخ: <b>{int(level2_rate * 100)}%</b>\n"
-                    f"👤 از: <code>{buyer_id}</code>{cap_note_l2}",
-                    parse_mode="HTML"
-                )
-            except:
-                pass
-
+                if level2_boost:
+                    level2_rate = level2_boost["level2"] / 100
+                else:
+                    level2_rate = 0.12
+                
+                level2_commission = level2_cappable_amount * level2_rate
+                await update_user_balance(int(level2_referrer_id), level2_commission, add=True)
+                
+                await append_row("Referrals", [
+                    str(level2_referrer_id),
+                    str(buyer_id),
+                    "2",
+                    str(level2_commission),
+                    "paid",
+                    purchase_id,
+                    now_iso(),
+                    now_iso()
+                ])
+                
+                try:
+                    cap_note_l2 = ""
+                    if amount_usd > level2_max_purchase:
+                        cap_note_l2 = f"\n\n💡 پورسانت تا سقف خرید شما (${level2_max_purchase}) محاسبه شد."
+                    
+                    boost_badge = "🌟 " if level2_boost else ""
+                    await bot.send_message(
+                        int(level2_referrer_id),
+                        f"🎉 <b>پورسانت سطح 2!</b>{boost_badge}\n\n"
+                        f"💰 مبلغ: <b>${level2_commission:.2f}</b>\n"
+                        f"📊 نرخ: <b>{int(level2_rate * 100)}%</b>\n"
+                        f"👤 از: <code>{buyer_id}</code>{cap_note_l2}",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+    
+    # ═══════════════════════════════════════════════════════
+    # Level 3+: افیلیت‌های عمیق (جدید!)
+    # ═══════════════════════════════════════════════════════
+    # دریافت زنجیره کامل
+    chain = await get_referral_chain(buyer_id, max_levels=50)
+    
+    # پردازش سطح ۳ به بعد
+    for item in chain[2:]:  # از سطح ۳ شروع کن (index 2)
+        level = item["level"]
+        referrer_id = item["referrer_id"]
+        
+        # چک اگه افیلیت هست
+        affiliate_config = await get_affiliate_config(int(referrer_id))
+        
+        if not affiliate_config["is_affiliate"]:
+            continue  # افیلیت نیست، بعدی
+        
+        # چک عمق مجاز
+        if level > affiliate_config["max_depth"]:
+            break  # از حد مجاز گذشته، تموم
+        
+        # محاسبه پورسانت
+        # سقف: بالاترین خرید این افیلیت
+        affiliate_max_purchase = await get_user_max_purchase(int(referrer_id))
+        affiliate_cappable = min(amount_usd, affiliate_max_purchase) if affiliate_max_purchase > 0 else 0
+        
+        if affiliate_cappable <= 0:
+            continue  # خریدی نداره
+        
+        rate = affiliate_config["rate"] / 100
+        commission = affiliate_cappable * rate
+        
+        # پرداخت
+        await update_user_balance(int(referrer_id), commission, add=True)
+        
+        await append_row("Referrals", [
+            str(referrer_id),
+            str(buyer_id),
+            str(level),  # سطح ۳، ۴، ۵، ...
+            str(commission),
+            "paid",
+            purchase_id,
+            now_iso(),
+            now_iso()
+        ])
+        
+        # نوتیف (مخفی - فقط به افیلیت)
+        try:
+            await bot.send_message(
+                int(referrer_id),
+                f"💎 <b>پورسانت افیلیت سطح {level}!</b>\n\n"
+                f"💰 مبلغ: <b>${commission:.2f}</b>\n"
+                f"📊 نرخ: <b>{int(rate * 100)}%</b>\n"
+                f"👤 از: <code>{buyer_id}</code>\n\n"
+                f"🔐 شما افیلیت ویژه هستید!",
+                parse_mode="HTML"
+            )
+        except:
+            pass
+        
+        logger.info(f"✅ Deep affiliate commission: Level {level} → {referrer_id} = ${commission:.2f}")
 
 # 
 # ============================================
@@ -4617,6 +4864,141 @@ async def callback_admin_fetch_usdt(callback: types.CallbackQuery):
         await callback.message.edit_text(f"❌ خطا: {e}")
         await callback.answer()
 
+@dp.message_handler(lambda msg: msg.text == "💎 افیلیت‌ها")
+async def handle_admin_affiliates_menu(message: types.Message):
+    """منوی مدیریت افیلیت‌ها (مخفی)"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.add(
+        InlineKeyboardButton("➕ افزودن افیلیت", callback_data="aff_create"),
+        InlineKeyboardButton("📋 لیست افیلیت‌ها", callback_data="aff_list")
+    )
+    kb.add(
+        InlineKeyboardButton("✏️ ویرایش افیلیت", callback_data="aff_edit"),
+        InlineKeyboardButton("❌ حذف افیلیت", callback_data="aff_delete")
+    )
+    
+    await message.reply(
+        "💎 <b>مدیریت افیلیت‌های عمیق</b>\n\n"
+        "افیلیت‌ها از سطح ۳ به بعد پورسانت دریافت می‌کنند.\n"
+        "این سیستم کاملاً مخفی است.\n\n"
+        "📝 <b>راهنما:</b>\n"
+        "• افزودن: <code>/makeaffiliate USER_ID DEPTH RATE</code>\n"
+        "• ویرایش: <code>/updateaffiliate USER_ID DEPTH RATE</code>\n"
+        "• لیست: دکمه پایین\n\n"
+        "مثال:\n"
+        "<code>/makeaffiliate 123456789 10 5</code>\n"
+        "(سطح ۳ تا ۱۰، نرخ ۵%)",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "aff_create")
+async def callback_aff_create(callback: types.CallbackQuery):
+    """راهنمای ساخت افیلیت"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "➕ <b>افزودن افیلیت جدید</b>\n\n"
+        "از دستور زیر استفاده کنید:\n\n"
+        "<code>/makeaffiliate USER_ID MAX_DEPTH RATE_PERCENT</code>\n\n"
+        "<b>پارامترها:</b>\n"
+        "• USER_ID: شناسه تلگرام کاربر\n"
+        "• MAX_DEPTH: حداکثر سطح (مثلاً ۱۰)\n"
+        "• RATE_PERCENT: نرخ پورسانت برای سطح ۳+ (مثلاً ۵)\n\n"
+        "<b>مثال:</b>\n"
+        "<code>/makeaffiliate 123456789 10 5</code>\n\n"
+        "این کاربر از سطح ۳ تا ۱۰ با نرخ ۵٪ پورسانت می‌گیرد.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "aff_list")
+async def callback_aff_list(callback: types.CallbackQuery):
+    """لیست افیلیت‌ها"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    rows = await get_all_rows("Affiliates")
+    
+    if len(rows) <= 1:
+        await callback.message.edit_text("📋 هیچ افیلیتی وجود ندارد.")
+        await callback.answer()
+        return
+    
+    text = "📋 <b>لیست افیلیت‌ها:</b>\n\n"
+    
+    for row in rows[1:]:
+        if not row or len(row) < 6:
+            continue
+        
+        telegram_id = row[0]
+        username = row[1] if len(row) > 1 else ""
+        full_name = row[2] if len(row) > 2 else ""
+        max_depth = row[3] if len(row) > 3 else "?"
+        rate = row[4] if len(row) > 4 else "?"
+        status = row[5] if len(row) > 5 else ""
+        
+        status_emoji = "✅" if status == "active" else "❌"
+        
+        text += (
+            f"{status_emoji} <b>{full_name}</b> (@{username or 'ندارد'})\n"
+            f"   🆔 <code>{telegram_id}</code>\n"
+            f"   📊 سطح ۳ تا {max_depth} | نرخ: {rate}%\n\n"
+        )
+    
+    await callback.message.edit_text(text, parse_mode="HTML")
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "aff_edit")
+async def callback_aff_edit(callback: types.CallbackQuery):
+    """راهنمای ویرایش"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "✏️ <b>ویرایش افیلیت</b>\n\n"
+        "از دستور زیر استفاده کنید:\n\n"
+        "<code>/updateaffiliate USER_ID MAX_DEPTH RATE_PERCENT</code>\n\n"
+        "<b>مثال:</b>\n"
+        "<code>/updateaffiliate 123456789 20 7</code>\n\n"
+        "این تنظیمات افیلیت را آپدیت می‌کند:\n"
+        "• سطح جدید: ۳ تا ۲۰\n"
+        "• نرخ جدید: ۷%\n\n"
+        "⚠️ فقط پورسانت‌های جدید تحت تأثیر قرار می‌گیرند.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.callback_query_handler(lambda c: c.data == "aff_delete")
+async def callback_aff_delete(callback: types.CallbackQuery):
+    """راهنمای حذف"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    await callback.message.edit_text(
+        "❌ <b>حذف افیلیت</b>\n\n"
+        "از دستور زیر استفاده کنید:\n\n"
+        "<code>/removeaffiliate USER_ID</code>\n\n"
+        "<b>مثال:</b>\n"
+        "<code>/removeaffiliate 123456789</code>\n\n"
+        "این افیلیت را غیرفعال می‌کند.\n"
+        "پورسانت‌های قبلی تغییر نمی‌کند.",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
 # ============================================
 # ADMIN COMMANDS
 # ============================================
@@ -5419,6 +5801,229 @@ async def cmd_list_boosts(message: types.Message):
     await message.reply(text, parse_mode="HTML")
 
 
+@dp.message_handler(commands=["makeaffiliate"])
+async def cmd_make_affiliate(message: types.Message):
+    """ساخت افیلیت جدید"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    parts = message.text.split()
+    
+    if len(parts) < 4:
+        await message.reply(
+            "❌ <b>فرمت نادرست!</b>\n\n"
+            "فرمت صحیح:\n"
+            "<code>/makeaffiliate USER_ID MAX_DEPTH RATE_PERCENT</code>\n\n"
+            "مثال:\n"
+            "<code>/makeaffiliate 123456789 10 5</code>",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        user_id = int(parts[1])
+        max_depth = int(parts[2])
+        rate_percent = float(parts[3])
+        notes = " ".join(parts[4:]) if len(parts) > 4 else ""
+        
+        # Validation
+        if max_depth < 3:
+            await message.reply("❌ حداقل سطح باید ۳ باشد!")
+            return
+        
+        if not (0 < rate_percent <= 50):
+            await message.reply("❌ نرخ باید بین ۰ تا ۵۰ درصد باشد!")
+            return
+        
+        # ساخت
+        success = await create_affiliate(user_id, max_depth, rate_percent, message.from_user.id, notes)
+        
+        if success:
+            # دریافت اطلاعات کاربر
+            user_result = await find_user(user_id)
+            username = ""
+            full_name = ""
+            
+            if user_result:
+                _, user_row = user_result
+                username = user_row[1] if len(user_row) > 1 else ""
+                full_name = user_row[2] if len(user_row) > 2 else ""
+            
+            await message.reply(
+                f"✅ <b>افیلیت ساخته شد!</b>\n\n"
+                f"👤 {full_name} (@{username or 'ندارد'})\n"
+                f"🆔 <code>{user_id}</code>\n\n"
+                f"📊 سطح: ۳ تا {max_depth}\n"
+                f"💰 نرخ: {rate_percent}%\n\n"
+                f"🔐 این کاربر از سطح ۳ به بعد تا سطح {max_depth} با نرخ {rate_percent}% پورسانت دریافت می‌کند.",
+                parse_mode="HTML"
+            )
+            
+            # نوتیف به افیلیت (مخفی)
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"💎 <b>تبریک! شما افیلیت ویژه شدید!</b>\n\n"
+                    f"از این لحظه از سطح ۳ تا {max_depth} با نرخ {rate_percent}% پورسانت دریافت می‌کنید.\n\n"
+                    f"🔐 این اطلاعات محرمانه است و فقط به شما اعلام شده.",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+        else:
+            await message.reply("❌ خطا! احتمالاً این کاربر قبلاً افیلیت است.")
+    
+    except ValueError:
+        await message.reply("❌ مقادیر نامعتبر! فقط عدد وارد کنید.")
+
+
+@dp.message_handler(commands=["updateaffiliate"])
+async def cmd_update_affiliate(message: types.Message):
+    """آپدیت افیلیت"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    parts = message.text.split()
+    
+    if len(parts) < 4:
+        await message.reply(
+            "❌ <b>فرمت نادرست!</b>\n\n"
+            "فرمت صحیح:\n"
+            "<code>/updateaffiliate USER_ID MAX_DEPTH RATE_PERCENT</code>\n\n"
+            "مثال:\n"
+            "<code>/updateaffiliate 123456789 20 7</code>",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        user_id = int(parts[1])
+        max_depth = int(parts[2])
+        rate_percent = float(parts[3])
+        
+        success = await update_affiliate(user_id, max_depth, rate_percent)
+        
+        if success:
+            await message.reply(
+                f"✅ <b>افیلیت آپدیت شد!</b>\n\n"
+                f"🆔 <code>{user_id}</code>\n"
+                f"📊 سطح جدید: ۳ تا {max_depth}\n"
+                f"💰 نرخ جدید: {rate_percent}%",
+                parse_mode="HTML"
+            )
+            
+            # نوتیف
+            try:
+                await bot.send_message(
+                    user_id,
+                    f"💎 <b>تنظیمات افیلیت شما آپدیت شد!</b>\n\n"
+                    f"📊 سطح: ۳ تا {max_depth}\n"
+                    f"💰 نرخ: {rate_percent}%",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+        else:
+            await message.reply("❌ افیلیت یافت نشد!")
+    
+    except ValueError:
+        await message.reply("❌ مقادیر نامعتبر!")
+
+
+@dp.message_handler(commands=["removeaffiliate"])
+async def cmd_remove_affiliate(message: types.Message):
+    """حذف/غیرفعال کردن افیلیت"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    parts = message.text.split()
+    
+    if len(parts) < 2:
+        await message.reply(
+            "❌ <b>فرمت نادرست!</b>\n\n"
+            "فرمت صحیح:\n"
+            "<code>/removeaffiliate USER_ID</code>\n\n"
+            "مثال:\n"
+            "<code>/removeaffiliate 123456789</code>",
+            parse_mode="HTML"
+        )
+        return
+    
+    try:
+        user_id = int(parts[1])
+        
+        success = await deactivate_affiliate(user_id)
+        
+        if success:
+            await message.reply(
+                f"✅ <b>افیلیت غیرفعال شد!</b>\n\n"
+                f"🆔 <code>{user_id}</code>\n\n"
+                f"این کاربر دیگر پورسانت سطح ۳+ دریافت نمی‌کند.",
+                parse_mode="HTML"
+            )
+            
+            # نوتیف
+            try:
+                await bot.send_message(
+                    user_id,
+                    "💎 وضعیت افیلیت شما تغییر کرد.\n"
+                    "برای اطلاعات بیشتر با پشتیبانی تماس بگیرید.",
+                    parse_mode="HTML"
+                )
+            except:
+                pass
+        else:
+            await message.reply("❌ افیلیت یافت نشد!")
+    
+    except ValueError:
+        await message.reply("❌ ID نامعتبر!")
+
+
+@dp.message_handler(commands=["listaffiliates"])
+async def cmd_list_affiliates(message: types.Message):
+    """لیست تمام افیلیت‌ها"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    rows = await get_all_rows("Affiliates")
+    
+    if len(rows) <= 1:
+        await message.reply("📋 هیچ افیلیتی وجود ندارد.")
+        return
+    
+    text = "📋 <b>لیست کامل افیلیت‌ها:</b>\n\n"
+    
+    active_count = 0
+    inactive_count = 0
+    
+    for row in rows[1:]:
+        if not row or len(row) < 6:
+            continue
+        
+        telegram_id = row[0]
+        username = row[1] if len(row) > 1 else ""
+        full_name = row[2] if len(row) > 2 else ""
+        max_depth = row[3] if len(row) > 3 else "?"
+        rate = row[4] if len(row) > 4 else "?"
+        status = row[5] if len(row) > 5 else ""
+        
+        if status == "active":
+            active_count += 1
+            status_emoji = "✅"
+        else:
+            inactive_count += 1
+            status_emoji = "❌"
+        
+        text += (
+            f"{status_emoji} <b>{full_name}</b>\n"
+            f"   @{username or 'ندارد'} | <code>{telegram_id}</code>\n"
+            f"   📊 L3-{max_depth} | {rate}%\n\n"
+        )
+    
+    text += f"\n📊 جمع: {active_count} فعال | {inactive_count} غیرفعال"
+    
+    await message.reply(text, parse_mode="HTML")
+
 @dp.message_handler(commands=["reset"])
 async def cmd_reset(message: types.Message):
     """پاک کردن state"""
@@ -5970,6 +6575,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
