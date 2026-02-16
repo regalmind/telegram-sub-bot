@@ -1668,19 +1668,22 @@ async def cmd_start(message: types.Message):
             )
             return
 
-    # ✅ اول از همه چک عضویت کانال
-    is_member, missing = await check_required_channels(user.id)
-    
-    if not is_member:
-        kb = channel_membership_keyboard(missing)
-        await send_and_record(
-            user.id,
-            "🔐 <b>برای استفاده از ربات ابتدا باید در کانال‌های زیر عضو شوید:</b>\n\n"
-            "پس از عضویت روی <b>✅ بررسی عضویت</b> کلیک کنید.",
-            parse_mode="HTML",
-            reply_markup=kb
-        )
-        return
+    # ✅ فیکس #2: چک عضویت کانال فقط اگه لینک هدیه نیست
+    # (برای لینک هدیه چک عضویت نمیخواد چون هنوز ثبت‌نام نکرده)
+    if not (args and args.startswith("gift_")):
+        # ✅ اول از همه چک عضویت کانال
+        is_member, missing = await check_required_channels(user.id)
+        
+        if not is_member:
+            kb = channel_membership_keyboard(missing)
+            await send_and_record(
+                user.id,
+                "🔐 <b>برای استفاده از ربات ابتدا باید در کانال‌های زیر عضو شوید:</b>\n\n"
+                "پس از عضویت روی <b>✅ بررسی عضویت</b> کلیک کنید.",
+                parse_mode="HTML",
+                reply_markup=kb
+            )
+            return
     
     # ✅ چک کردن یوزر در دیتابیس
     result = await find_user(user.id)
@@ -1702,7 +1705,8 @@ async def cmd_start(message: types.Message):
     else:
         # ✅ یوزر جدیده - ثبت کن
         referred_by = ""
-        if args:
+        # ✅ فیکس #1: لینک هدیه رو به عنوان رفرال حساب نکن
+        if args and not args.startswith("gift_"):
             rows = await get_all_rows("Users")
             for r in rows[1:]:
                 if len(r) > 4 and r[4].upper() == args.upper():
@@ -1719,7 +1723,8 @@ async def cmd_start(message: types.Message):
             "0",
             "active",
             now_iso(),
-            now_iso()
+            now_iso(),
+            ""  # ✅ فیکس #1: فیلد ۱۱ boost_data
         ]
         
         await append_row("Users", new_row)
@@ -1733,7 +1738,7 @@ async def cmd_start(message: types.Message):
             "مثال: <code>example@gmail.com</code>",
             parse_mode="HTML"
         )
-        return
+        return  # ✅ فیکس #1: این return ضروریه!
 
     # ✅ تشخیص ادمین و تعیین منو و پیام
     if is_admin(user.id):
@@ -1775,6 +1780,27 @@ async def cmd_start(message: types.Message):
             reply_markup=menu_kb
         )
 
+
+@dp.message_handler(commands=["amiadmin"])
+async def cmd_am_i_admin(message: types.Message):
+    """تست ادمین بودن"""
+    user_id = message.from_user.id
+    
+    admin1 = os.getenv("ADMIN_TELEGRAM_ID")
+    admin2 = os.getenv("ADMIN2_TELEGRAM_ID")
+    
+    result = is_admin(user_id)
+    
+    await message.reply(
+        f"🆔 <b>ID شما:</b> <code>{user_id}</code>\n\n"
+        f"👤 <b>ادمین اصلی:</b> <code>{admin1}</code>\n"
+        f"👤 <b>ادمین دوم:</b> <code>{admin2 or 'تنظیم نشده'}</code>\n\n"
+        f"{'✅ شما ادمین هستید!' if result else '❌ شما ادمین نیستید!'}",
+        parse_mode="HTML"
+    )
+
+
+# 
 
 @dp.callback_query_handler(lambda c: c.data == "check_membership")
 async def callback_check_membership(callback: types.CallbackQuery):
@@ -4957,6 +4983,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
