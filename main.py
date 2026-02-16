@@ -697,11 +697,42 @@ def social_share_keyboard(product: str = "subscription") -> InlineKeyboardMarkup
     return kb
 
 
+async def get_user_max_purchase(telegram_id: int) -> float:
+    """
+    دریافت بالاترین مبلغ خرید تایید شده کاربر
+    Returns: مبلغ به دلار (float)
+    """
+    try:
+        purchases_rows = await get_all_rows("Purchases")
+        max_purchase = 0.0
+        
+        for row in purchases_rows[1:]:
+            if not row or len(row) < 9:
+                continue
+            
+            # چک اگه این خرید برای این کاربر و تایید شده
+            if str(row[1]) == str(telegram_id) and row[8] == "approved":
+                try:
+                    amount = float(row[4]) if len(row) > 4 and row[4] else 0.0
+                    if amount > max_purchase:
+                        max_purchase = amount
+                except:
+                    pass
+        
+        return max_purchase
+        
+    except Exception as e:
+        logger.exception(f"Error getting max purchase for {telegram_id}: {e}")
+        return 0.0
+
+
+# 
+    
 # ============================================
 # REFERRAL SYSTEM
 # ============================================
 async def process_referral_commission(purchase_id: str, buyer_id: int, amount_usd: float):
-    """Process referral commissions"""
+    """Process referral commissions با محدودیت سقف خرید"""
     buyer_result = await find_user(buyer_id)
     if not buyer_result:
         return
@@ -712,17 +743,26 @@ async def process_referral_commission(purchase_id: str, buyer_id: int, amount_us
     if not referrer_id:
         return
     
-    # Level 1: 8%
-    # چک بوست ویژه برای معرف
+    # ✅ دریافت سقف خرید referrer (Level 1)
+    referrer_max_purchase = await get_user_max_purchase(int(referrer_id))
+    
+    # محاسبه مبلغ قابل پورسانت (محدود به سقف خرید referrer)
+    cappable_amount = min(amount_usd, referrer_max_purchase) if referrer_max_purchase > 0 else 0
+    
+    if cappable_amount <= 0:
+        logger.info(f"⚠️ Referrer {referrer_id} has no purchase, skipping commission")
+        return
+    
+    # Level 1: محاسبه با سقف
     referrer_boost = await get_user_boost(int(referrer_id))
-
+    
     if referrer_boost:
-        level1_rate = referrer_boost["level1"] / 100  # مثلاً 15% = 0.15
+        level1_rate = referrer_boost["level1"] / 100
     else:
         level1_rate = 0.08  # پیش‌فرض ۸٪
-
-    level1_commission = amount_usd * level1_rate
-
+    
+    level1_commission = cappable_amount * level1_rate
+    
     await update_user_balance(int(referrer_id), level1_commission, add=True)
     
     await append_row("Referrals", [
@@ -738,25 +778,40 @@ async def process_referral_commission(purchase_id: str, buyer_id: int, amount_us
     
     # Notify level 1
     try:
+        cap_note = ""
+        if amount_usd > referrer_max_purchase:
+            cap_note = f"\n\n💡 پورسانت تا سقف خرید شما (${referrer_max_purchase}) محاسبه شد."
+        
         await bot.send_message(
             int(referrer_id),
             f"🎉 <b>پورسانت جدید!</b>\n\n"
             f"💰 مبلغ: <b>${level1_commission:.2f}</b>\n"
-            f"👤 از: <code>{buyer_id}</code>\n\n"
-            f"💎 موجودی شما افزایش یافت!",
+            f"👤 از: <code>{buyer_id}</code>\n"
+            f"📊 نرخ: {int(level1_rate * 100)}%{cap_note}",
             parse_mode="HTML"
         )
     except:
         pass
     
-      # Level 2: 12% (یا بوست ویژه اگه داشته باشه)
+    # ✅ چک بوست خودکار
+    asyncio.create_task(check_and_grant_auto_boost(int(referrer_id)))
+    
+    # Level 2: محاسبه با سقف
     referrer_result = await find_user(int(referrer_id))
     if referrer_result:
         _, referrer_row = referrer_result
         level2_referrer_id = referrer_row[5] if len(referrer_row) > 5 else ""
         
         if level2_referrer_id and level2_referrer_id != str(buyer_id):
-            # چک بوست ویژه برای معرف سطح 2
+            # ✅ دریافت سقف خرید referrer سطح ۲
+            level2_max_purchase = await get_user_max_purchase(int(level2_referrer_id))
+            level2_cappable_amount = min(amount_usd, level2_max_purchase) if level2_max_purchase > 0 else 0
+            
+            if level2_cappable_amount <= 0:
+                logger.info(f"⚠️ Level2 referrer {level2_referrer_id} has no purchase, skipping")
+                return
+            
+            # چک بوست ویژه
             level2_referrer_boost = await get_user_boost(int(level2_referrer_id))
             
             if level2_referrer_boost:
@@ -764,7 +819,7 @@ async def process_referral_commission(purchase_id: str, buyer_id: int, amount_us
             else:
                 level2_rate = 0.12  # پیش‌فرض ۱۲٪
             
-            level2_commission = amount_usd * level2_rate
+            level2_commission = level2_cappable_amount * level2_rate
             await update_user_balance(int(level2_referrer_id), level2_commission, add=True)
             
             await append_row("Referrals", [
@@ -779,20 +834,24 @@ async def process_referral_commission(purchase_id: str, buyer_id: int, amount_us
             ])
             
             try:
+                cap_note_l2 = ""
+                if amount_usd > level2_max_purchase:
+                    cap_note_l2 = f"\n\n💡 پورسانت تا سقف خرید شما (${level2_max_purchase}) محاسبه شد."
+                
                 boost_badge = "🌟 " if level2_referrer_boost else ""
                 await bot.send_message(
                     int(level2_referrer_id),
                     f"🎉 <b>پورسانت سطح 2!</b>{boost_badge}\n\n"
                     f"💰 مبلغ: <b>${level2_commission:.2f}</b>\n"
                     f"📊 نرخ: <b>{int(level2_rate * 100)}%</b>\n"
-                    f"👤 از: <code>{buyer_id}</code>\n\n"
-                    f"💎 موجودی شما افزایش یافت!",
+                    f"👤 از: <code>{buyer_id}</code>{cap_note_l2}",
                     parse_mode="HTML"
                 )
             except:
                 pass
 
 
+# 
 # ============================================
 # SUBSCRIPTION MANAGEMENT
 # ============================================
@@ -5093,6 +5152,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
