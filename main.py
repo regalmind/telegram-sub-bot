@@ -1475,109 +1475,115 @@ async def get_user_boost(telegram_id: int) -> Optional[Dict[str, int]]:
 
 async def check_and_grant_auto_boost(telegram_id: int):
     """
-    چک میکنه اگه کاربر ۱۰ رفرال مستقیم داشت و هنوز بوست نگرفته،
-    خودکار یه کد بوست یکبار مصرف براش بسازه و فعالش کنه
+    چک و اعطای بوست خودکار ۱۰ رفرال
+    این بوست مستقل از بوست دستی ادمین هست
     """
     try:
-        # چک اگه قبلاً بوست داره
-        existing_boost = await get_user_boost(telegram_id)
-        if existing_boost:
-            return  # قبلاً بوست داره، کاری نکن
+        # ✅ چک اگه قبلاً بوست اتومات گرفته
+        result = await find_user(telegram_id)
+        if not result:
+            return
         
-        # شمارش رفرال‌های سطح ۱ (مستقیم)
+        _, user_row = result
+        boost_data = user_row[10] if len(user_row) > 10 else ""
+        
+        # اگه بوست با AUTO10_ داره = قبلاً گرفته
+        if boost_data and "AUTO10_" in boost_data:
+            return
+        
+        # شمارش رفرال‌های سطح ۱
         referrals_rows = await get_all_rows("Referrals")
         direct_referrals = 0
         
         for row in referrals_rows[1:]:
             if not row or len(row) < 3:
                 continue
-            
-            # چک اگه این کاربر referrer هست و سطح ۱
             if str(row[0]) == str(telegram_id) and row[2] == "1":
                 direct_referrals += 1
         
-        # اگه کمتر از ۱۰ تا داره، هیچ کاری نکن
         if direct_referrals < 10:
             return
         
-        # ✅ رسید به ۱۰ رفرال! ساخت کد بوست
-        logger.info(f"🎉 User {telegram_id} reached 10 direct referrals! Granting auto-boost...")
+        logger.info(f"🎉 User {telegram_id} reached 10 referrals!")
         
-        # ساخت کد یکبار مصرف
         boost_code = f"AUTO10_{telegram_id}_{int(time.time())}"
-        
-        # نرخ‌ها: L1=10%, L2=15%
         level1_percent = 10
         level2_percent = 15
         
-        # ساخت کد با max_uses=1 (یکبار مصرف)
+        # ساخت کد
         success = await create_boost_code(
             code=boost_code,
             level1_percent=level1_percent,
             level2_percent=level2_percent,
-            max_uses=1,  # فقط یکبار (برای خودش)
-            valid_days=36500,  # ۱۰۰ سال = عملاً نامحدود
-            created_by=0  # سیستم خودکار
+            max_uses=1,
+            valid_days=36500,
+            created_by=0
         )
         
         if not success:
-            logger.error(f"Failed to create auto-boost code for {telegram_id}")
             return
         
-        # فعال‌سازی خودکار برای این کاربر
-        result = await validate_and_apply_boost(boost_code, telegram_id)
+        # ✅ ثبت در Users
+        users_rows = await get_all_rows("Users")
+        for u_idx, u_row in enumerate(users_rows[1:], start=2):
+            if u_row and str(u_row[0]) == str(telegram_id):
+                current_boost = u_row[10] if len(u_row) > 10 else ""
+                
+                # اگه بوست دستی داره (شروع با boost: ولی نه AUTO)
+                if current_boost and current_boost.startswith("boost:") and "AUTO10_" not in current_boost:
+                    # بوست دستی داره - note کن
+                    u_row[10] = current_boost + f"|auto:{boost_code}"
+                else:
+                    # بوست نداره - بوست اتومات بذار
+                    while len(u_row) < 11:
+                        u_row.append("")
+                    u_row[10] = f"boost:{boost_code}:{level1_percent}:{level2_percent}"
+                
+                await update_row("Users", u_idx, u_row)
+                
+                # Mark used
+                boost_rows = await get_all_rows("BoostCodes")
+                for b_idx, b_row in enumerate(boost_rows[1:], start=2):
+                    if b_row and b_row[0] == boost_code:
+                        b_row[4] = "1"
+                        await update_row("BoostCodes", b_idx, b_row)
+                        break
+                break
         
-        if not result or result.get("error"):
-            logger.error(f"Failed to apply auto-boost for {telegram_id}")
-            return
-        
-        # ✅ ارسال پیام به کاربر
+        # پیام به کاربر
         try:
             await bot.send_message(
                 telegram_id,
-                f"🎉 <b>تبریک! پاداش ۱۰ معرفی مستقیم!</b>\n\n"
-                f"✨ شما به <b>۱۰ معرفی مستقیم</b> رسیدید!\n\n"
-                f"🎁 <b>پاداش شما:</b>\n"
-                f"📊 سطح ۱: <b>{level1_percent}%</b> (قبلاً ۸%)\n"
-                f"📊 سطح ۲: <b>{level2_percent}%</b> (قبلاً ۱۲%)\n\n"
-                f"💎 از این لحظه تمام پورسانت‌های شما با نرخ جدید محاسبه می‌شود!\n\n"
-                f"🚀 با ادامه معرفی، درآمد بیشتری کسب کنید!",
+                f"🎉 <b>تبریک! پاداش ۱۰ معرفی!</b>\n\n"
+                f"✨ به <b>۱۰ معرفی مستقیم</b> رسیدید!\n\n"
+                f"🎁 نرخ جدید:\n"
+                f"📊 سطح ۱: <b>{level1_percent}%</b>\n"
+                f"📊 سطح ۲: <b>{level2_percent}%</b>\n\n"
+                f"💎 تمام پورسانت‌ها با نرخ جدید!",
                 parse_mode="HTML"
             )
-        except Exception as e:
-            logger.exception(f"Failed to notify user {telegram_id}: {e}")
+        except:
+            pass
         
-        # نوتیف به ادمین
+        # نوتیف ادمین
         if ADMIN_TELEGRAM_ID:
             try:
-                # دریافت اطلاعات کاربر
-                user_result = await find_user(telegram_id)
-                username = ""
-                full_name = ""
-                if user_result:
-                    _, user_row = user_result
-                    username = user_row[1] if len(user_row) > 1 else ""
-                    full_name = user_row[2] if len(user_row) > 2 else ""
-                
                 await bot.send_message(
                     int(ADMIN_TELEGRAM_ID),
-                    f"🎉 <b>بوست خودکار اعطا شد!</b>\n\n"
-                    f"👤 کاربر: {full_name} (@{username or 'ندارد'})\n"
-                    f"🆔 ID: <code>{telegram_id}</code>\n"
-                    f"👥 معرفی‌های مستقیم: <b>{direct_referrals}</b>\n\n"
-                    f"🎟 کد: <code>{boost_code}</code>\n"
-                    f"📊 نرخ جدید: L1={level1_percent}% | L2={level2_percent}%",
+                    f"🎉 <b>بوست خودکار!</b>\n\n"
+                    f"🆔 <code>{telegram_id}</code>\n"
+                    f"👥 {direct_referrals} معرفی\n"
+                    f"🎟 <code>{boost_code}</code>",
                     parse_mode="HTML"
                 )
-            except Exception as e:
-                logger.exception(f"Failed to notify admin: {e}")
-        
-        logger.info(f"✅ Auto-boost granted to {telegram_id}")
+            except:
+                pass
         
     except Exception as e:
-        logger.exception(f"Error in check_and_grant_auto_boost: {e}")
+        logger.exception(f"Auto-boost error: {e}")
 
 
+# 
 
 
 
@@ -3205,17 +3211,25 @@ async def handle_referral(message: types.Message):
     """Referral handler"""
     user = message.from_user
     
-    # ✅ چک عضویت
+    # چک عضویت
     if not await check_membership_for_all_messages(message):
         return
     
-    # Check if user has active subscription
-    subscription = await get_active_subscription(user.id)
+    # ✅ چک خرید تایید شده
+    purchases_rows = await get_all_rows("Purchases")
+    has_purchase = False
     
-    if not subscription:
+    for row in purchases_rows[1:]:
+        if not row or len(row) < 9:
+            continue
+        if str(row[1]) == str(user.id) and row[8] == "approved":
+            has_purchase = True
+            break
+    
+    if not has_purchase:
         await message.reply(
             "⚠️ <b>برای استفاده از سیستم معرفی، ابتدا باید اشتراک خریداری کنید.</b>\n\n"
-            "پس از خرید اشتراک، کد معرف شما فعال می‌شود.",
+            "پس از خرید و تایید، کد معرف فعال می‌شود.",
             parse_mode="HTML",
             reply_markup=main_menu_keyboard()
         )
@@ -5152,6 +5166,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
