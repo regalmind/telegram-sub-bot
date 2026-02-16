@@ -349,24 +349,103 @@ def is_admin(user_id: int) -> bool:
 # NOBITEX API FOR IRR PRICE
 # ============================================
 async def get_usdt_price_irr() -> float:
-    """Get USDT price in IRR from Nobitex (accurate)"""
+    """
+    Get USDT price in IRR
+    اول از Config sheet میخونه، اگه نبود fallback به Nobitex API
+    """
     try:
+        # ✅ اول از Google Sheet بخون
+        config_rows = await get_all_rows("Config")
+        
+        for row in config_rows[1:]:
+            if not row or len(row) < 2:
+                continue
+            
+            key = row[0].strip() if len(row) > 0 else ""
+            value = row[1].strip() if len(row) > 1 else ""
+            
+            if key == "usdt_price_irr" and value:
+                try:
+                    price = float(value)
+                    logger.info(f"💱 USDT (از Config): {price:,.0f} تومان")
+                    return price
+                except:
+                    pass
+        
+        # اگه توی Config نبود، سعی کن از Nobitex بگیر
+        logger.info("💱 قیمت USDT در Config نبود، Nobitex...")
+        
         async with ClientSession() as session:
-            async with session.get("https://api.nobitex.ir/v2/orderbook/USDTIRT") as resp:
+            async with session.get("https://api.nobitex.ir/v2/orderbook/USDTIRT", timeout=5) as resp:
                 if resp.status == 200:
                     data = await resp.json()
                     asks = data.get("asks", [])
                     if asks and len(asks) > 0:
-                        # قیمت به ریال هست، تبدیل به تومان
                         price_rial = float(asks[0][0])
                         price_toman = price_rial / 10
-                        logger.info(f"💱 USDT: {price_toman:,.0f} تومان")
+                        logger.info(f"💱 USDT (از Nobitex): {price_toman:,.0f} تومان")
                         return price_toman
     except Exception as e:
-        logger.exception(f"Nobitex API error: {e}")
+        logger.exception(f"Nobitex/Config error: {e}")
     
-    # Fallback: قیمت تقریبی فعلی
+    # Fallback نهایی
+    logger.warning("⚠️ Using fallback USDT price: 160,000 تومان")
     return 160000.0
+
+
+# 
+
+async def get_usdt_price_from_config() -> float:
+    """دریافت قیمت USDT از Config"""
+    try:
+        config_rows = await get_all_rows("Config")
+        
+        for row in config_rows[1:]:
+            if not row or len(row) < 2:
+                continue
+            
+            if row[0].strip() == "usdt_price_irr":
+                return float(row[1].strip())
+        
+        return 160000.0  # پیش‌فرض
+    except:
+        return 160000.0
+
+
+async def set_usdt_price_in_config(new_price: float) -> bool:
+    """تنظیم قیمت USDT در Config"""
+    try:
+        config_rows = await get_all_rows("Config")
+        
+        # پیدا کردن ردیف موجود
+        for idx, row in enumerate(config_rows[1:], start=2):
+            if not row or len(row) < 1:
+                continue
+            
+            if row[0].strip() == "usdt_price_irr":
+                # آپدیت
+                row[1] = str(new_price)
+                if len(row) < 3:
+                    row.append("قیمت تتر به تومان (دستی)")
+                await update_row("Config", idx, row)
+                logger.info(f"✅ USDT price updated to {new_price:,.0f}")
+                return True
+        
+        # اگه نبود، اضافه کن
+        await append_row("Config", [
+            "usdt_price_irr",
+            str(new_price),
+            "قیمت تتر به تومان (دستی)"
+        ])
+        logger.info(f"✅ USDT price created: {new_price:,.0f}")
+        return True
+        
+    except Exception as e:
+        logger.exception(f"Error setting USDT price: {e}")
+        return False
+
+
+# 
 
 
 # ============================================
@@ -554,7 +633,7 @@ def main_menu_keyboard():
     return kb
 
 def admin_menu_keyboard():
-    """منوی اختصاصی ادمین با دکمه‌های مدیریتی"""
+    """منوی اختصاصی ادمین"""
     kb = ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row(
         KeyboardButton("📊 آمار سیستم"),
@@ -570,9 +649,15 @@ def admin_menu_keyboard():
     )
     kb.row(
         KeyboardButton("👤 جستجوی کاربر"),
+        KeyboardButton("💱 قیمت تتر")  # ← دکمه جدید
+    )
+    kb.row(
         KeyboardButton("🔙 منوی عادی")
     )
     return kb
+
+
+# 
 
 def subscription_keyboard():
     """Subscription purchase keyboard"""
@@ -3897,6 +3982,121 @@ async def handle_user_search_query(message: types.Message):
     
     await message.reply(text, parse_mode="HTML")
 
+@dp.message_handler(lambda msg: msg.text == "💱 قیمت تتر")
+async def handle_admin_usdt_price(message: types.Message):
+    """منوی مدیریت قیمت تتر"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    current_price = await get_usdt_price_from_config()
+    
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(
+        InlineKeyboardButton("✏️ تغییر قیمت", callback_data="admin_change_usdt"),
+        InlineKeyboardButton("🔄 بروزرسانی از Nobitex", callback_data="admin_fetch_usdt")
+    )
+    
+    await message.reply(
+        f"💱 <b>مدیریت قیمت تتر</b>\n\n"
+        f"💵 قیمت فعلی: <b>{current_price:,.0f}</b> تومان\n\n"
+        f"📝 این قیمت برای محاسبه خرید کارت بانکی استفاده می‌شود.",
+        parse_mode="HTML",
+        reply_markup=kb
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_change_usdt")
+async def callback_admin_change_usdt(callback: types.CallbackQuery):
+    """درخواست تغییر قیمت"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    user_states[callback.from_user.id] = {"state": "awaiting_usdt_price"}
+    
+    current_price = await get_usdt_price_from_config()
+    
+    await callback.message.edit_text(
+        f"💱 <b>تغییر قیمت تتر</b>\n\n"
+        f"💵 قیمت فعلی: <b>{current_price:,.0f}</b> تومان\n\n"
+        f"لطفاً قیمت جدید را به <b>تومان</b> وارد کنید:\n\n"
+        f"مثال: <code>165000</code>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@dp.message_handler(lambda msg: user_states.get(msg.from_user.id, {}).get("state") == "awaiting_usdt_price")
+async def handle_usdt_price_input(message: types.Message):
+    """دریافت قیمت جدید تتر"""
+    if not is_admin(message.from_user.id):
+        return
+    
+    user_states.pop(message.from_user.id, None)
+    
+    try:
+        new_price = float(message.text.strip().replace(",", ""))
+        
+        if new_price <= 0:
+            await message.reply("❌ قیمت نامعتبر!")
+            return
+        
+        # ذخیره در Config
+        success = await set_usdt_price_in_config(new_price)
+        
+        if success:
+            await message.reply(
+                f"✅ <b>قیمت تتر بروزرسانی شد!</b>\n\n"
+                f"💵 قیمت جدید: <b>{new_price:,.0f}</b> تومان\n\n"
+                f"💡 از این لحظه تمام خریدهای کارت بانکی با قیمت جدید محاسبه می‌شود.",
+                parse_mode="HTML"
+            )
+        else:
+            await message.reply("❌ خطا در بروزرسانی!")
+            
+    except ValueError:
+        await message.reply("❌ لطفاً فقط عدد وارد کنید!\n\nمثال: <code>165000</code>", parse_mode="HTML")
+
+
+@dp.callback_query_handler(lambda c: c.data == "admin_fetch_usdt")
+async def callback_admin_fetch_usdt(callback: types.CallbackQuery):
+    """دریافت خودکار از Nobitex"""
+    if not is_admin(callback.from_user.id):
+        await callback.answer("⛔️", show_alert=True)
+        return
+    
+    await callback.message.edit_text("⏳ در حال دریافت از Nobitex...")
+    
+    try:
+        async with ClientSession() as session:
+            async with session.get("https://api.nobitex.ir/v2/orderbook/USDTIRT", timeout=5) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    asks = data.get("asks", [])
+                    if asks and len(asks) > 0:
+                        price_rial = float(asks[0][0])
+                        price_toman = price_rial / 10
+                        
+                        # ذخیره
+                        await set_usdt_price_in_config(price_toman)
+                        
+                        await callback.message.edit_text(
+                            f"✅ <b>قیمت از Nobitex دریافت شد!</b>\n\n"
+                            f"💵 قیمت جدید: <b>{price_toman:,.0f}</b> تومان\n\n"
+                            f"💡 قیمت بروزرسانی و در Config ذخیره شد.",
+                            parse_mode="HTML"
+                        )
+                        await callback.answer()
+                        return
+        
+        await callback.message.edit_text("❌ خطا در دریافت از Nobitex!")
+        await callback.answer()
+        
+    except Exception as e:
+        logger.exception(f"Nobitex fetch error: {e}")
+        await callback.message.edit_text(f"❌ خطا: {e}")
+        await callback.answer()
+
 # ============================================
 # ADMIN COMMANDS
 # ============================================
@@ -5166,6 +5366,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
