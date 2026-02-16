@@ -3304,8 +3304,6 @@ async def handle_help(message: types.Message):
     if not await check_membership_for_all_messages(message):
         return
     
-    # ... بقیه کد
-
     await message.reply(
         "📚 <b>راهنما</b>\n\n"
         "🆓 <b>تست کانال:</b>\n"
@@ -3318,19 +3316,23 @@ async def handle_help(message: types.Message):
         "• موجودی و برداشت\n"
         "• حداقل: $10\n\n"
         "🎁 <b>دعوت:</b>\n"
-        "• سطح 1: 8%\n"
-        "• سطح 2: 12%\n"
-        "• نامحدود!\n\n"
+        "• سطح 1: 8% (تا ۱۰ معرفی)\n"
+        "• سطح 2: 12%\n\n"
+        "✨ <b>پاداش ۱۰ معرفی:</b>\n"
+        "• با رسیدن به ۱۰ معرفی مستقیم\n"
+        "• سطح 1: 10% (بجای ۸%)\n"
+        "• سطح 2: 15% (بجای ۱۲%)\n"
+        "• خودکار فعال می‌شود!\n\n"
         "💬 <b>پشتیبانی:</b>\n"
         "• ثبت تیکت\n"
-        "• پاسخ سریع"
-        "\n\n📊 <b>گزارش ماهانه:</b>\n"
+        "• پاسخ سریع\n\n"
+        "📊 <b>گزارش ماهانه:</b>\n"
         "• /report - مشاهده گزارش فعالیت\n"
         "• ارسال خودکار اول هر ماه",
-        
         parse_mode="HTML",
         reply_markup=main_menu_keyboard()
     )
+
 
 @dp.message_handler(commands=["report"])
 async def cmd_report(message: types.Message):
@@ -5091,6 +5093,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
