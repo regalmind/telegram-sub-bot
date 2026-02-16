@@ -3047,7 +3047,6 @@ async def callback_admin_card_approval(callback: types.CallbackQuery):
 # ============================================
 @dp.callback_query_handler(lambda c: (c.data.startswith("approve_") or c.data.startswith("reject_")) and not c.data.startswith("approve_card_") and not c.data.startswith("reject_card_") and not c.data.startswith("approve_wd_") and not c.data.startswith("reject_wd_"))
 async def callback_admin_purchase(callback: types.CallbackQuery):
-
     """Admin purchase approval"""
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔️ شما ادمین نیستید!", show_alert=True)
@@ -3085,43 +3084,223 @@ async def callback_admin_purchase(callback: types.CallbackQuery):
         user_result = await find_user(user_id)
         username = user_result[1][1] if user_result else ""
         
-        await activate_subscription(user_id, username, product, payment_method)
-        await process_referral_commission(purchase_id, user_id, amount_usd)
+        # ✅ چک نوع خرید
+        is_reserve = product.startswith("reserve_")
+        is_complete = product.startswith("complete_")
+        is_gift = product.startswith("gift_")
         
-        try:
-            result = await find_user(user_id)
-            if result:
-                _, row = result
-                referral_code = row[4] if len(row) > 4 else ""
-                
+        # ─────────────────────────────────────────────────────────
+        # حالت ۱: پیش‌پرداخت (رزرو)
+        # ─────────────────────────────────────────────────────────
+        if is_reserve:
+            actual_product = product.replace("reserve_", "")
+            
+            # ثبت رزرو
+            await set_user_reserve(user_id, actual_product, 2.0)
+            
+            # پیام به کاربر
+            product_name = "ویژه" if actual_product == "premium" else "معمولی"
+            total = PREMIUM_PRICE if actual_product == "premium" else NORMAL_PRICE
+            remaining = total - 2.0
+            
+            try:
                 await bot.send_message(
                     user_id,
-                    f"🎉 <b>پرداخت تایید شد!</b>\n\n"
-                    f"✅ اشتراک فعال شد\n"
-                    f"📅 مدت: ۶ ماه\n\n"
-                    f"🎁 کد معرف:\n<code>{referral_code}</code>\n\n"
-                    f"💡 با دعوت دوستان پورسانت کسب کنید!",
+                    f"✅ <b>پیش‌پرداخت تایید شد!</b>\n\n"
+                    f"🎉 جایگاه شما رزرو شد!\n\n"
+                    f"📦 محصول: اشتراک {product_name}\n"
+                    f"💵 پرداخت شده: <b>$2.00</b>\n"
+                    f"💰 باقیمانده: <b>${remaining:.2f}</b>\n\n"
+                    f"⚠️ برای فعال‌سازی کامل، باید مبلغ باقیمانده را پرداخت کنید.\n\n"
+                    f"💡 از منوی 💰 کیف پول → 💵 تکمیل پیش‌پرداخت استفاده کنید.",
                     parse_mode="HTML",
                     reply_markup=main_menu_keyboard()
                 )
-        except:
-            pass
-        
-        try:
-            await callback.message.edit_caption(
-                caption=callback.message.caption + "\n\n✅ <b>تایید شد</b>",
-                parse_mode="HTML"
-            )
-        except:
+            except Exception as e:
+                logger.exception(f"Failed to send reserve confirmation: {e}")
+            
+            # پیام ادمین
             try:
-                await callback.message.edit_text(
-                    callback.message.text + "\n\n✅ <b>تایید شد</b>",
+                await callback.message.edit_caption(
+                    caption=callback.message.caption + "\n\n✅ <b>رزرو ثبت شد</b>",
                     parse_mode="HTML"
                 )
             except:
-                pass
+                try:
+                    await callback.message.edit_text(
+                        callback.message.text + "\n\n✅ <b>رزرو ثبت شد</b>",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
+            await callback.answer("✅ رزرو ثبت شد")
         
-        await callback.answer("✅ تایید شد")
+        # ─────────────────────────────────────────────────────────
+        # حالت ۲: تکمیل پیش‌پرداخت
+        # ─────────────────────────────────────────────────────────
+        elif is_complete:
+            actual_product = product.replace("complete_", "")
+            
+            # دریافت اطلاعات رزرو
+            reserve = await get_user_reserve_status(user_id)
+            
+            if not reserve["has_reserve"]:
+                logger.error(f"Complete payment but no reserve for {user_id}")
+                await callback.answer("❌ رزرو یافت نشد!", show_alert=True)
+                return
+            
+            # ✅ فعال‌سازی اشتراک
+            await activate_subscription(user_id, username, actual_product, payment_method)
+            
+            # ✅ محاسبه پورسانت با کل مبلغ (رزرو + تکمیل)
+            total_paid = reserve["amount_paid"] + amount_usd
+            await process_referral_commission(purchase_id, user_id, total_paid)
+            
+            # ✅ پاک کردن رزرو
+            await clear_user_reserve(user_id)
+            
+            # ✅ ارسال لینک معرف و پیام تبریک
+            try:
+                result = await find_user(user_id)
+                if result:
+                    _, user_row = result
+                    referral_code = user_row[4] if len(user_row) > 4 else ""
+                    
+                    kb_share = social_share_keyboard("ویژه" if actual_product == "premium" else "معمولی")
+                    
+                    await bot.send_message(
+                        user_id,
+                        f"🎉 <b>اشتراک فعال شد!</b>\n\n"
+                        f"✅ پرداخت تکمیل شد\n"
+                        f"📅 مدت: ۶ ماه\n\n"
+                        f"🎁 کد معرف شما:\n<code>{referral_code}</code>\n\n"
+                        f"💡 با دعوت دوستان پورسانت کسب کنید!\n\n"
+                        f"📢 این خبر خوب را به اشتراک بگذارید:",
+                        parse_mode="HTML",
+                        reply_markup=kb_share
+                    )
+                    logger.info(f"✅ Completed pre-payment for {user_id}")
+            except Exception as e:
+                logger.exception(f"Failed to send completion message: {e}")
+            
+            # پیام ادمین
+            try:
+                await callback.message.edit_caption(
+                    caption=callback.message.caption + "\n\n✅ <b>تکمیل شد و فعال شد</b>",
+                    parse_mode="HTML"
+                )
+            except:
+                try:
+                    await callback.message.edit_text(
+                        callback.message.text + "\n\n✅ <b>تکمیل شد و فعال شد</b>",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
+            await callback.answer("✅ تکمیل و فعال شد")
+        
+        # ─────────────────────────────────────────────────────────
+        # حالت ۳: هدیه
+        # ─────────────────────────────────────────────────────────
+        elif is_gift:
+            actual_product = product.replace("gift_", "")
+            
+            # دریافت پیام هدیه
+            gift_message = ""
+            if user_id in user_states:
+                gift_message = user_states[user_id].get("gift_message", "")
+            
+            # ساخت گیفت کارت
+            gift_code = await create_gift_card(actual_product, user_id, username, gift_message)
+            
+            if gift_code:
+                bot_username = (await bot.get_me()).username
+                gift_link = f"https://t.me/{bot_username}?start=gift_{gift_code}"
+                
+                try:
+                    await bot.send_message(
+                        user_id,
+                        f"🎁 <b>هدیه شما آماده شد!</b>\n\n"
+                        f"🔗 <b>لینک هدیه:</b>\n<code>{gift_link}</code>\n\n"
+                        f"💡 این لینک را برای دوست خود ارسال کنید.\n"
+                        f"او با کلیک روی لینک، اشتراک فعال می‌شود!",
+                        parse_mode="HTML",
+                        reply_markup=main_menu_keyboard()
+                    )
+                    logger.info(f"✅ Gift card sent to {user_id}")
+                except Exception as e:
+                    logger.exception(f"Failed to send gift: {e}")
+            
+            # حذف state
+            user_states.pop(user_id, None)
+            
+            # پیام ادمین
+            try:
+                await callback.message.edit_caption(
+                    caption=callback.message.caption + "\n\n✅ <b>هدیه ساخته شد</b>",
+                    parse_mode="HTML"
+                )
+            except:
+                try:
+                    await callback.message.edit_text(
+                        callback.message.text + "\n\n✅ <b>هدیه ساخته شد</b>",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
+            await callback.answer("✅ هدیه ساخته شد")
+        
+        # ─────────────────────────────────────────────────────────
+        # حالت ۴: خرید عادی
+        # ─────────────────────────────────────────────────────────
+        else:
+            try:
+                await activate_subscription(user_id, username, product, payment_method)
+                await process_referral_commission(purchase_id, user_id, amount_usd)
+            except Exception as e:
+                logger.exception(f"Failed to activate: {e}")
+            
+            try:
+                result = await find_user(user_id)
+                if result:
+                    _, user_row = result
+                    referral_code = user_row[4] if len(user_row) > 4 else ""
+                    
+                    kb_share = social_share_keyboard("ویژه" if product == "premium" else "معمولی")
+                    
+                    await bot.send_message(
+                        user_id,
+                        f"🎉 <b>پرداخت تایید شد!</b>\n\n"
+                        f"✅ اشتراک فعال شد\n"
+                        f"📅 مدت: ۶ ماه\n\n"
+                        f"🎁 کد معرف:\n<code>{referral_code}</code>\n\n"
+                        f"💡 با دعوت دوستان پورسانت کسب کنید!\n\n"
+                        f"📢 این خبر را به اشتراک بگذارید:",
+                        parse_mode="HTML",
+                        reply_markup=kb_share
+                    )
+                    logger.info(f"✅ Approval sent to {user_id}")
+            except Exception as e:
+                logger.exception(f"Failed to send approval: {e}")
+            
+            try:
+                await callback.message.edit_caption(
+                    caption=callback.message.caption + "\n\n✅ <b>تایید شد</b>",
+                    parse_mode="HTML"
+                )
+            except:
+                try:
+                    await callback.message.edit_text(
+                        callback.message.text + "\n\n✅ <b>تایید شد</b>",
+                        parse_mode="HTML"
+                    )
+                except:
+                    pass
+            
+            await callback.answer("✅ تایید شد")
     
     else:
         purchase_row[8] = "rejected"
@@ -5339,19 +5518,103 @@ async def poll_sheets_auto_process():
                     if admin_action == "approve":
                         logger.info(f"✅ Auto-approving {purchase_id} for user {telegram_id}")
                         
-                        # ✅ آپدیت #13: چک اگر خرید هدیه است
+                        # ✅ چک نوع خرید
+                        is_reserve = product.startswith("reserve_")
+                        is_complete = product.startswith("complete_")
                         is_gift = product.startswith("gift_")
                         
-                        if is_gift:
-                            # خرید هدیه - ساخت گیفت کارت
+                        # ─────────────────────────────────────────────────────────
+                        # حالت ۱: پیش‌پرداخت (رزرو)
+                        # ─────────────────────────────────────────────────────────
+                        if is_reserve:
+                            actual_product = product.replace("reserve_", "")
+                            
+                            # ثبت رزرو
+                            await set_user_reserve(telegram_id, actual_product, 2.0)
+                            
+                            # پیام به کاربر
+                            product_name = "ویژه" if actual_product == "premium" else "معمولی"
+                            total = PREMIUM_PRICE if actual_product == "premium" else NORMAL_PRICE
+                            remaining = total - 2.0
+                            
+                            try:
+                                await bot.send_message(
+                                    telegram_id,
+                                    f"✅ <b>پیش‌پرداخت تایید شد!</b>\n\n"
+                                    f"🎉 جایگاه شما رزرو شد!\n\n"
+                                    f"📦 محصول: اشتراک {product_name}\n"
+                                    f"💵 پرداخت شده: <b>$2.00</b>\n"
+                                    f"💰 باقیمانده: <b>${remaining:.2f}</b>\n\n"
+                                    f"⚠️ برای فعال‌سازی کامل، باید مبلغ باقیمانده را پرداخت کنید.\n\n"
+                                    f"💡 از منوی 💰 کیف پول → 💵 تکمیل پیش‌پرداخت استفاده کنید.",
+                                    parse_mode="HTML",
+                                    reply_markup=main_menu_keyboard()
+                                )
+                                logger.info(f"✅ Sent reserve confirmation to {telegram_id}")
+                            except Exception as e:
+                                logger.exception(f"Failed to send reserve: {e}")
+                        
+                        # ─────────────────────────────────────────────────────────
+                        # حالت ۲: تکمیل پیش‌پرداخت
+                        # ─────────────────────────────────────────────────────────
+                        elif is_complete:
+                            actual_product = product.replace("complete_", "")
+                            
+                            # دریافت رزرو
+                            reserve = await get_user_reserve_status(telegram_id)
+                            
+                            if not reserve["has_reserve"]:
+                                logger.error(f"Complete but no reserve for {telegram_id}")
+                            else:
+                                # فعال‌سازی
+                                try:
+                                    await activate_subscription(telegram_id, username, actual_product, payment_method)
+                                    
+                                    # محاسبه پورسانت با کل مبلغ
+                                    total_paid = reserve["amount_paid"] + amount_usd
+                                    await process_referral_commission(purchase_id, telegram_id, total_paid)
+                                    
+                                    # پاک رزرو
+                                    await clear_user_reserve(telegram_id)
+                                except Exception as e:
+                                    logger.exception(f"Failed to activate completion: {e}")
+                                
+                                # پیام
+                                try:
+                                    result = await find_user(telegram_id)
+                                    if result:
+                                        _, user_row = result
+                                        referral_code = user_row[4] if len(user_row) > 4 else ""
+                                        
+                                        kb_share = social_share_keyboard("ویژه" if actual_product == "premium" else "معمولی")
+                                        
+                                        await bot.send_message(
+                                            telegram_id,
+                                            f"🎉 <b>اشتراک فعال شد!</b>\n\n"
+                                            f"✅ پرداخت تکمیل شد\n"
+                                            f"📅 مدت: ۶ ماه\n\n"
+                                            f"🎁 کد معرف:\n<code>{referral_code}</code>\n\n"
+                                            f"💡 با دعوت دوستان پورسانت کسب کنید!\n\n"
+                                            f"📢 این خبر را به اشتراک بگذارید:",
+                                            parse_mode="HTML",
+                                            reply_markup=kb_share
+                                        )
+                                        logger.info(f"✅ Sent completion to {telegram_id}")
+                                except Exception as e:
+                                    logger.exception(f"Failed to send completion: {e}")
+                        
+                        # ─────────────────────────────────────────────────────────
+                        # حالت ۳: هدیه
+                        # ─────────────────────────────────────────────────────────
+                        elif is_gift:
                             actual_product = product.replace("gift_", "")
                             
-                            # دریافت پیام هدیه از user_states
+                            # دریافت پیام هدیه
                             gift_message = ""
                             if telegram_id in user_states:
                                 gift_message = user_states[telegram_id].get("gift_message", "")
                             
-                            # ساخت گیفت کارت
+                            # ساخت گیفت
                             gift_code = await create_gift_card(actual_product, telegram_id, username, gift_message)
                             
                             if gift_code:
@@ -5368,15 +5631,16 @@ async def poll_sheets_auto_process():
                                         parse_mode="HTML",
                                         reply_markup=main_menu_keyboard()
                                     )
-                                    logger.info(f"✅ Sent gift card to {telegram_id}")
-                                except Exception as e:
-                                    logger.exception(f"Failed to send gift card: {e}")
+                                except:
+                                    pass
                             
                             # حذف state
                             user_states.pop(telegram_id, None)
                         
+                        # ─────────────────────────────────────────────────────────
+                        # حالت ۴: خرید عادی
+                        # ─────────────────────────────────────────────────────────
                         else:
-                            # خرید عادی - فعال‌سازی مستقیم
                             try:
                                 await activate_subscription(telegram_id, username, product, payment_method)
                                 await process_referral_commission(purchase_id, telegram_id, amount_usd)
@@ -5388,8 +5652,7 @@ async def poll_sheets_auto_process():
                                 if result:
                                     _, user_row = result
                                     referral_code = user_row[4] if len(user_row) > 4 else ""
-
-                                    # ✅ آپدیت #19: اضافه دکمه‌های اشتراک‌گذاری
+                                    
                                     kb_share = social_share_keyboard("ویژه" if product == "premium" else "معمولی")
                                     
                                     await bot.send_message(
@@ -5399,13 +5662,13 @@ async def poll_sheets_auto_process():
                                         f"📅 مدت: ۶ ماه\n\n"
                                         f"🎁 کد معرف:\n<code>{referral_code}</code>\n\n"
                                         f"💡 با دعوت دوستان پورسانت کسب کنید!\n\n"
-                                        f"📢 این خبر خوب را با دوستان به اشتراک بگذارید:",
+                                        f"📢 این خبر را به اشتراک بگذارید:",
                                         parse_mode="HTML",
                                         reply_markup=kb_share
                                     )
                                     logger.info(f"✅ Sent approval to {telegram_id}")
-                            except Exception as e:
-                                logger.exception(f"Failed to send approval: {e}")
+                            except:
+                                pass
                         
                         # Auto-fill columns
                         row[admin_action_idx] = ""  # Clear action
@@ -5414,7 +5677,7 @@ async def poll_sheets_auto_process():
                         row[approved_by_idx] = "admin"
                         row[notes_idx] = "auto_processed"
                         await update_row("Purchases", idx, row)
-                    
+
                     # Process REJECT
                     elif admin_action == "reject":
                         logger.info(f"❌ Auto-rejecting {purchase_id} for user {telegram_id}")
@@ -5707,6 +5970,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
