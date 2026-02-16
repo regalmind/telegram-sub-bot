@@ -1414,6 +1414,113 @@ async def get_user_boost(telegram_id: int) -> Optional[Dict[str, int]]:
         logger.exception(f"Error getting user boost: {e}")
         return None
 
+async def check_and_grant_auto_boost(telegram_id: int):
+    """
+    چک میکنه اگه کاربر ۱۰ رفرال مستقیم داشت و هنوز بوست نگرفته،
+    خودکار یه کد بوست یکبار مصرف براش بسازه و فعالش کنه
+    """
+    try:
+        # چک اگه قبلاً بوست داره
+        existing_boost = await get_user_boost(telegram_id)
+        if existing_boost:
+            return  # قبلاً بوست داره، کاری نکن
+        
+        # شمارش رفرال‌های سطح ۱ (مستقیم)
+        referrals_rows = await get_all_rows("Referrals")
+        direct_referrals = 0
+        
+        for row in referrals_rows[1:]:
+            if not row or len(row) < 3:
+                continue
+            
+            # چک اگه این کاربر referrer هست و سطح ۱
+            if str(row[0]) == str(telegram_id) and row[2] == "1":
+                direct_referrals += 1
+        
+        # اگه کمتر از ۱۰ تا داره، هیچ کاری نکن
+        if direct_referrals < 10:
+            return
+        
+        # ✅ رسید به ۱۰ رفرال! ساخت کد بوست
+        logger.info(f"🎉 User {telegram_id} reached 10 direct referrals! Granting auto-boost...")
+        
+        # ساخت کد یکبار مصرف
+        boost_code = f"AUTO10_{telegram_id}_{int(time.time())}"
+        
+        # نرخ‌ها: L1=10%, L2=15%
+        level1_percent = 10
+        level2_percent = 15
+        
+        # ساخت کد با max_uses=1 (یکبار مصرف)
+        success = await create_boost_code(
+            code=boost_code,
+            level1_percent=level1_percent,
+            level2_percent=level2_percent,
+            max_uses=1,  # فقط یکبار (برای خودش)
+            valid_days=36500,  # ۱۰۰ سال = عملاً نامحدود
+            created_by=0  # سیستم خودکار
+        )
+        
+        if not success:
+            logger.error(f"Failed to create auto-boost code for {telegram_id}")
+            return
+        
+        # فعال‌سازی خودکار برای این کاربر
+        result = await validate_and_apply_boost(boost_code, telegram_id)
+        
+        if not result or result.get("error"):
+            logger.error(f"Failed to apply auto-boost for {telegram_id}")
+            return
+        
+        # ✅ ارسال پیام به کاربر
+        try:
+            await bot.send_message(
+                telegram_id,
+                f"🎉 <b>تبریک! پاداش ۱۰ معرفی مستقیم!</b>\n\n"
+                f"✨ شما به <b>۱۰ معرفی مستقیم</b> رسیدید!\n\n"
+                f"🎁 <b>پاداش شما:</b>\n"
+                f"📊 سطح ۱: <b>{level1_percent}%</b> (قبلاً ۸%)\n"
+                f"📊 سطح ۲: <b>{level2_percent}%</b> (قبلاً ۱۲%)\n\n"
+                f"💎 از این لحظه تمام پورسانت‌های شما با نرخ جدید محاسبه می‌شود!\n\n"
+                f"🚀 با ادامه معرفی، درآمد بیشتری کسب کنید!",
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.exception(f"Failed to notify user {telegram_id}: {e}")
+        
+        # نوتیف به ادمین
+        if ADMIN_TELEGRAM_ID:
+            try:
+                # دریافت اطلاعات کاربر
+                user_result = await find_user(telegram_id)
+                username = ""
+                full_name = ""
+                if user_result:
+                    _, user_row = user_result
+                    username = user_row[1] if len(user_row) > 1 else ""
+                    full_name = user_row[2] if len(user_row) > 2 else ""
+                
+                await bot.send_message(
+                    int(ADMIN_TELEGRAM_ID),
+                    f"🎉 <b>بوست خودکار اعطا شد!</b>\n\n"
+                    f"👤 کاربر: {full_name} (@{username or 'ندارد'})\n"
+                    f"🆔 ID: <code>{telegram_id}</code>\n"
+                    f"👥 معرفی‌های مستقیم: <b>{direct_referrals}</b>\n\n"
+                    f"🎟 کد: <code>{boost_code}</code>\n"
+                    f"📊 نرخ جدید: L1={level1_percent}% | L2={level2_percent}%",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.exception(f"Failed to notify admin: {e}")
+        
+        logger.info(f"✅ Auto-boost granted to {telegram_id}")
+        
+    except Exception as e:
+        logger.exception(f"Error in check_and_grant_auto_boost: {e}")
+
+
+
+
 
 async def calculate_dashboard_stats() -> Dict[str, Any]:
     """Calculate comprehensive dashboard statistics"""
@@ -2940,6 +3047,7 @@ async def process_withdrawal_approval(withdrawal_id: str, withdrawal_idx: int,
 # ============================================
 @dp.callback_query_handler(lambda c: c.data.startswith("approve_wd_") or c.data.startswith("reject_wd_"))
 async def callback_admin_withdrawal(callback: types.CallbackQuery):
+ 
     """Admin withdrawal approval from Telegram"""
     if not is_admin(callback.from_user.id):
         await callback.answer("⛔️ شما ادمین نیستید!", show_alert=True)
@@ -4983,6 +5091,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
