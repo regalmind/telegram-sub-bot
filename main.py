@@ -3223,12 +3223,20 @@ async def callback_admin_card_approval(callback: types.CallbackQuery):
                 await update_row("Purchases", purchase_idx, row)
             except ValueError:
                 # Fallback: update status directly
-                status_idx = header.index("status")
-                row[status_idx] = "approved"
-                row[header.index("approved_at")] = now_iso()
-                row[header.index("approved_by")] = str(callback.from_user.id)
-                await update_row("Purchases", purchase_idx, row)
-                
+                try:
+                    status_idx = header.index("status")
+                    approved_at_idx = header.index("approved_at")
+                    approved_by_idx = header.index("approved_by")
+                    
+                    row[status_idx] = "approved"
+                    row[approved_at_idx] = now_iso()
+                    row[approved_by_idx] = str(callback.from_user.id)
+                    await update_row("Purchases", purchase_idx, row)
+                except ValueError as e:
+                    logger.error(f"Column not found: {e}")
+                    await callback.answer("❌ خطای ساختار شیت!", show_alert=True)
+                    return
+
                 # Manually process
                 await activate_subscription(user_id, username, product, payment_method)
                 await process_referral_commission(purchase_id, user_id, amount_usd)
@@ -6567,6 +6575,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
