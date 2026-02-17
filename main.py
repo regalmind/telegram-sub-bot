@@ -1076,7 +1076,8 @@ async def check_reserve_block(message: types.Message) -> bool:
     total_price = PREMIUM_PRICE if reserve["product"] == "premium" else NORMAL_PRICE
     remaining = total_price - paid
     
-    await message.reply(
+    await send_and_record(
+        massage.from_user.id,
         f"⏳ <b>پیش‌پرداخت فعال</b>\n\n"
         f"شما رزرو انجام داده‌اید:\n"
         f"📦 محصول: اشتراک {product_name}\n"
@@ -2567,13 +2568,9 @@ async def handle_test_channel(message: types.Message):
     if not await check_membership_for_all_messages(message):
         return
 
-        
     # ✅ چک رزرو
     if not await check_reserve_block(message):
         return
-    
-    # ... بقیه کد
-
     
     if not TEST_CHANNEL_ID:
         await message.reply("❌ کانال تست در دسترس نیست.")
@@ -2630,13 +2627,10 @@ async def handle_buy_subscription(message: types.Message):
     # ✅ چک عضویت
     if not await check_membership_for_all_messages(message):
         return
-
-        
+      
     # ✅ چک رزرو
     if not await check_reserve_block(message):
         return
-    
-    # ... بقیه کد
 
     kb = subscription_keyboard()
     await send_and_record(
@@ -2747,8 +2741,6 @@ async def callback_reserve_product(callback: types.CallbackQuery):
     )
     await callback.answer()
 
-
-# 
 
 @dp.callback_query_handler(lambda c: c.data == "buy_gift")
 async def callback_buy_gift(callback: types.CallbackQuery):
@@ -4052,7 +4044,6 @@ async def handle_referral(message: types.Message):
     # چک عضویت
     if not await check_membership_for_all_messages(message):
         return
-
         
     # ✅ چک رزرو
     if not await check_reserve_block(message):
@@ -4162,14 +4153,11 @@ async def handle_support(message: types.Message):
     # ✅ چک عضویت
     if not await check_membership_for_all_messages(message):
         return
-
-        
+    
     # ✅ چک رزرو
     if not await check_reserve_block(message):
         return
     
-    # ... بقیه کد
-
     user_states[message.from_user.id] = {"state": "awaiting_support_message"}
     
     await message.reply(
@@ -4224,8 +4212,7 @@ async def handle_help(message: types.Message):
     # ✅ چک عضویت
     if not await check_membership_for_all_messages(message):
         return
-
-        
+  
     # ✅ چک رزرو
     if not await check_reserve_block(message):
         return
@@ -4269,7 +4256,6 @@ async def cmd_report(message: types.Message):
     if not await check_membership_for_all_messages(message):
         return
 
-        
     # ✅ چک رزرو
     if not await check_reserve_block(message):
         return
@@ -6581,6 +6567,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
