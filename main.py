@@ -1029,7 +1029,7 @@ async def get_user_max_purchase(telegram_id: int) -> float:
                 continue
             
             # چک اگه این خرید برای این کاربر و تایید شده
-            if str(row[1]) == str(telegram_id) and row[8] == "approved":
+            if str(row[1]) == str(telegram_id) and row[9] == "approved":
                 try:
                     amount = float(row[4]) if len(row) > 4 and row[4] else 0.0
                     if amount > max_purchase:
@@ -2754,11 +2754,11 @@ async def callback_buy_gift(callback: types.CallbackQuery):
     has_purchased = False
     
     for row in purchases_rows[1:]:
-        if not row or len(row) < 9:
+        if not row or len(row) < 10:
             continue
         
         # چک اگه این کاربر خرید تایید شده داره
-        if str(row[1]) == str(user.id) and row[8] == "approved":
+        if str(row[1]) == str(user.id) and row[9] == "approved":
             # فقط خریدهای واقعی (نه هدیه) رو حساب کن
             product = row[3] if len(row) > 3 else ""
             if not product.startswith("gift_"):
@@ -3323,9 +3323,9 @@ async def callback_admin_purchase(callback: types.CallbackQuery):
     payment_method = purchase_row[6]
     
     if action == "approve":
-        purchase_row[8] = "approved"
-        purchase_row[10] = now_iso()
-        purchase_row[11] = str(callback.from_user.id)
+        purchase_row[9] = "approved"
+        purchase_row[11] = now_iso()
+        purchase_row[12] = str(callback.from_user.id)
         await update_row("Purchases", purchase_idx, purchase_row)
         
         user_result = await find_user(user_id)
@@ -3550,9 +3550,9 @@ async def callback_admin_purchase(callback: types.CallbackQuery):
             await callback.answer("✅ تایید شد")
     
     else:
-        purchase_row[8] = "rejected"
-        purchase_row[10] = now_iso()
-        purchase_row[11] = str(callback.from_user.id)
+        purchase_row[9] = "rejected"
+        purchase_row[11] = now_iso()
+        purchase_row[12] = str(callback.from_user.id)
         await update_row("Purchases", purchase_idx, purchase_row)
         
         try:
@@ -4057,9 +4057,9 @@ async def handle_referral(message: types.Message):
     has_purchase = False
     
     for row in purchases_rows[1:]:
-        if not row or len(row) < 9:
+        if not row or len(row) < 10:
             continue
-        if str(row[1]) == str(user.id) and row[8] == "approved":
+        if str(row[1]) == str(user.id) and row[9] == "approved":
             has_purchase = True
             break
     
@@ -6575,6 +6575,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
