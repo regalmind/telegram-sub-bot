@@ -1072,8 +1072,8 @@ async def check_reserve_block(message: types.Message) -> bool:
     # ✅ رزرو داره! بلاک کن
     product_name = "ویژه" if reserve["product"] == "premium" else "معمولی"
     paid = reserve["amount_paid"]
-    
-    total_price = NORMAL_PRICE if reserve["product"] == "normal" else PREMIUM_PRICE
+       
+    total_price = PREMIUM_PRICE if reserve["product"] == "premium" else NORMAL_PRICE
     remaining = total_price - paid
     
     await message.reply(
@@ -1101,10 +1101,13 @@ async def get_referral_chain(telegram_id: int, max_levels: int = 20) -> list:
         chain = []
         current_id = telegram_id
         level = 1
+        visited = set()
+        visited.add(telegram_id)
         
         users_rows = await get_all_rows("Users")
         
         while level <= max_levels:
+
             # پیدا کردن referrer فعلی
             referrer_id = None
             
@@ -6575,6 +6578,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
