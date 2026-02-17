@@ -3266,15 +3266,19 @@ async def callback_admin_card_approval(callback: types.CallbackQuery):
             # Update sheet
             header = rows[0]
             try:
-                admin_action_idx = header.index("admin_action")
-                row[admin_action_idx] = "reject"
-                await update_row("Purchases", purchase_idx, row)
-            except ValueError:
                 status_idx = header.index("status")
+                approved_at_idx = header.index("approved_at")
+                approved_by_idx = header.index("approved_by")
+                
                 row[status_idx] = "rejected"
-                row[header.index("approved_at")] = now_iso()
-                row[header.index("approved_by")] = str(callback.from_user.id)
+                row[approved_at_idx] = now_iso()
+                row[approved_by_idx] = str(callback.from_user.id)
                 await update_row("Purchases", purchase_idx, row)
+            except ValueError as e:
+                logger.error(f"Column not found: {e}")
+                await callback.answer("❌ خطای ساختار شیت!", show_alert=True)
+                return
+
                 
                 await bot.send_message(
                     user_id,
@@ -6575,6 +6579,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
