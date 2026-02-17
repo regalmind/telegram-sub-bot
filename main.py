@@ -1118,9 +1118,11 @@ async def get_referral_chain(telegram_id: int, max_levels: int = 20) -> list:
                 referrer_id = row[5] if len(row) > 5 and row[5] else None
                 break
             
-            # اگه referrer نداره یا خودش بود، تموم شد
-            if not referrer_id or referrer_id == str(telegram_id):
+            # اگه referrer نداره یا قبلاً دیده شده، تموم شد
+            if not referrer_id or int(referrer_id) in visited:
                 break
+            
+            visited.add(int(referrer_id))
             
             chain.append({
                 "level": level,
@@ -1129,6 +1131,7 @@ async def get_referral_chain(telegram_id: int, max_levels: int = 20) -> list:
             
             current_id = int(referrer_id)
             level += 1
+
         
         return chain
         
@@ -6578,6 +6581,7 @@ if __name__ == "__main__":
         logger.info("⛔️ Stopped by user")
     except Exception as e:
         logger.exception(f"💥 Fatal error: {e}")
+
 
 
 
